@@ -1,221 +1,140 @@
 import { Router, Request, Response } from 'express';
 import { v4 as uuid } from 'uuid';
-import type { LaunchRecord, SSECallback } from '../types';
-import { executeLaunch } from '../services/launch-executor';
-import { fundingMiddleware, FundingRequest } from '../middleware/funding';
-import fs from 'fs';
-import path from 'path';
+import type { LaunchRecord, LaunchParams, StageEvent } from '../types';
+import { executeLaunch, simulateLaunch, fundingPlan, MAX_BUNDLE_WALLETS } from '../services/launch-executor';
+import { readLaunches, saveLaunch, deleteLaunch } from '../services/launches';
+import { requireFunding, type FundingRequest } from '../services/funding';
+import { isNotBackedUp, notBackedUpBody } from '../services/backup';
 
 const router = Router();
 
-const activeStreams = new Map<string, SSECallback[]>();
+// ── launch progress: every event is kept so a stream that connects late replays the history ──
 
-const LAUNCHES_FILE = path.join(__dirname, '../../data/launches.json');
-
-function readLaunches(): LaunchRecord[] {
-  if (!fs.existsSync(LAUNCHES_FILE)) return [];
-  return JSON.parse(fs.readFileSync(LAUNCHES_FILE, 'utf8') || '[]');
-}
-
-function writeLaunches(launches: LaunchRecord[]) {
-  fs.writeFileSync(LAUNCHES_FILE, JSON.stringify(launches, null, 2));
-}
-
-function saveLaunch(launch: LaunchRecord) {
-  const launches = readLaunches();
-  const idx = launches.findIndex(l => l.id === launch.id);
-  if (idx >= 0) launches[idx] = launch;
-  else launches.push(launch);
-  writeLaunches(launches);
-}
+const streams = new Map<string, Array<(e: StageEvent) => void>>();
+const history = new Map<string, { at: number; events: StageEvent[] }>();
+const HISTORY_MAX_EVENTS = 300;
+const HISTORY_TTL_MS = 24 * 60 * 60 * 1000;
 
 function emit(launchId: string, data: Record<string, unknown>) {
-  const listeners = activeStreams.get(launchId) || [];
-  for (const cb of listeners) cb(data as { stage: string; message: string; [k: string]: unknown });
+  const event = data as StageEvent;
+  let hist = history.get(launchId);
+  if (!hist) {
+    hist = { at: Date.now(), events: [] };
+    history.set(launchId, hist);
+    for (const [id, h] of history) if (Date.now() - h.at > HISTORY_TTL_MS) history.delete(id);
+  }
+  if (hist.events.length < HISTORY_MAX_EVENTS) hist.events.push(event);
+  for (const cb of streams.get(launchId) ?? []) cb(event);
 }
 
-// ── Routes ──
+function finalEventFor(launch: LaunchRecord | undefined): StageEvent | null {
+  if (!launch) return null;
+  if (launch.status === 'confirmed') return { stage: 'done', message: 'Launch confirmed!', signature: launch.signature, mint: launch.mintAddress };
+  if (launch.status === 'error') return { stage: 'error', message: launch.error || 'Launch failed' };
+  return null;
+}
+
+/** The form → launch params, with defaults. */
+function readParams(body: any): LaunchParams {
+  const n = (v: unknown, d: number) => (typeof v === 'number' && !isNaN(v) ? v : typeof v === 'string' && v.trim() && !isNaN(Number(v)) ? Number(v) : d);
+  const nums = (v: unknown): number[] => (Array.isArray(v) ? v.map(x => n(x, 0.5)) : []);
+  const ids = (v: unknown): (string | null)[] | undefined => (Array.isArray(v) && v.some(Boolean) ? v.map(x => (typeof x === 'string' && x ? x : null)) : undefined);
+  return {
+    tokenName: String(body.tokenName ?? '').trim(),
+    tokenSymbol: String(body.tokenSymbol ?? '').trim(),
+    description: String(body.description ?? ''),
+    imageUrl: String(body.imageUrl ?? ''),
+    website: String(body.website ?? ''),
+    twitter: String(body.twitter ?? ''),
+    telegram: String(body.telegram ?? ''),
+    devBuyAmount: n(body.devBuyAmount, 0.5),
+    bundleWalletCount: Math.max(0, Math.min(MAX_BUNDLE_WALLETS, Math.floor(n(body.bundleWalletCount, 0)))),
+    bundleSwapAmounts: nums(body.bundleSwapAmounts),
+    holderWalletCount: Math.max(0, Math.floor(n(body.holderWalletCount, 0))),
+    holderSwapAmounts: nums(body.holderSwapAmounts),
+    holderAutoBuy: body.holderAutoBuy === true,
+    holderAutoBuyDelay: n(body.holderAutoBuyDelay, 0),
+    useJito: body.useJito !== false,
+    strictBundle: body.strictBundle !== false,
+    autoSellAfterLaunch: body.autoSellAfterLaunch === true,
+    mintAddressMode: body.mintAddressMode === 'vanity' ? 'vanity' : 'random',
+    devWalletId: typeof body.devWalletId === 'string' && body.devWalletId ? body.devWalletId : undefined,
+    bundleWalletIds: ids(body.bundleWalletIds),
+    holderWalletIds: ids(body.holderWalletIds),
+  };
+}
 
 router.get('/', (_req: Request, res: Response) => {
-  const launches = readLaunches();
-  res.json(launches.slice(-50).reverse());
+  res.json(readLaunches().slice(-50).reverse());
+});
+
+/** The cost of a plan, without touching anything (the Launch page's summary). */
+router.post('/plan', (req: Request, res: Response) => {
+  res.json(fundingPlan(readParams(req.body ?? {})));
+});
+
+/** Dry run: checks + a simulated create (POST /api/sol/simulate). Nothing moves. */
+router.post('/simulate', requireFunding, async (req: FundingRequest, res: Response) => {
+  try {
+    res.json(await simulateLaunch(readParams(req.body ?? {}), req.fundingKeypair!));
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+router.post('/', requireFunding, (req: FundingRequest, res: Response) => {
+  const params = readParams(req.body ?? {});
+  if (!params.tokenName || !params.tokenSymbol) return res.status(400).json({ error: 'tokenName and tokenSymbol required' });
+  if (!params.imageUrl) return res.status(400).json({ error: 'A launch needs an image: add one on the Launch form.' });
+
+  const launchId = uuid();
+  const launch: LaunchRecord = {
+    id: launchId, tokenName: params.tokenName, tokenSymbol: params.tokenSymbol, imageUrl: params.imageUrl || undefined,
+    status: 'pending', createdAt: new Date().toISOString(), params,
+  };
+  saveLaunch(launch);
+  res.json({ launchId, status: 'pending', stream: `/api/launch/${launchId}/stream` });
+
+  executeLaunch(launchId, params, emit, req.fundingKeypair!).catch(err => {
+    console.error('[launch] fatal:', err);
+    if (isNotBackedUp(err)) emit(launchId, { stage: 'error', message: notBackedUpBody(err).error, code: err.code });
+  });
 });
 
 router.get('/:id', (req: Request, res: Response) => {
-  const launches = readLaunches();
-  const id = String(req.params.id);
-  const launch = launches.find(l => l.id === id);
+  const launch = readLaunches().find(l => l.id === String(req.params.id));
   if (!launch) return res.status(404).json({ error: 'Not found' });
   res.json(launch);
 });
 
 router.delete('/:id', (req: Request, res: Response) => {
-  const id = String(req.params.id);
-  const launches = readLaunches();
-  const idx = launches.findIndex(l => l.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-  const removed = launches.splice(idx, 1)[0];
-  writeLaunches(launches);
+  const removed = deleteLaunch(String(req.params.id));
+  if (!removed) return res.status(404).json({ error: 'Not found' });
   res.json({ deleted: removed.id, tokenName: removed.tokenName });
 });
 
+/** Server-sent events: the launch's history first, then live stages until done / error. */
 router.get('/:id/stream', (req: Request, res: Response) => {
   const launchId = String(req.params.id);
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  const send = (e: StageEvent) => res.write(`data: ${JSON.stringify(e)}\n\n`);
 
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
-  });
+  const events = history.get(launchId)?.events ?? [];
+  send({ stage: 'replay-start', message: '' });
+  for (const ev of events) send(ev);
+  if (!events.some(ev => ev.stage === 'done' || ev.stage === 'error')) {
+    const final = finalEventFor(readLaunches().find(l => l.id === launchId));
+    if (final) send(final);
+  }
 
-  const callback: SSECallback = (data) => {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-  };
-
-  if (!activeStreams.has(launchId)) activeStreams.set(launchId, []);
-  activeStreams.get(launchId)!.push(callback);
-
+  if (!streams.has(launchId)) streams.set(launchId, []);
+  streams.get(launchId)!.push(send);
+  const keepalive = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* closed */ } }, 15_000);
   req.on('close', () => {
-    const arr = activeStreams.get(launchId) || [];
-    const idx = arr.indexOf(callback);
+    clearInterval(keepalive);
+    const arr = streams.get(launchId) ?? [];
+    const idx = arr.indexOf(send);
     if (idx >= 0) arr.splice(idx, 1);
-  });
-});
-
-router.post('/:id/relaunch', fundingMiddleware, async (req: FundingRequest, res: Response) => {
-  const id = String(req.params.id);
-  const launches = readLaunches();
-  const source = launches.find(l => l.id === id);
-  if (!source) return res.status(404).json({ error: 'Launch not found' });
-  if (!source.params) {
-    return res.status(400).json({
-      error: 'Cannot relaunch: this launch was created before relaunch was available. Use the Launch page to create a new token.',
-    });
-  }
-
-  const p = source.params;
-  const launchId = uuid();
-  const launch: LaunchRecord = {
-    id: launchId,
-    tokenName: p.tokenName,
-    tokenSymbol: p.tokenSymbol,
-    imageUrl: p.imageUrl || undefined,
-    status: 'pending',
-    createdAt: new Date().toISOString(),
-    params: { ...p, mintAddressMode: 'random', vanityMintPublicKey: '' },
-  };
-  saveLaunch(launch);
-
-  res.json({ launchId, status: 'pending' });
-
-  const sessionId = (req.headers['x-session-id'] as string)?.trim();
-  executeLaunch(launchId, {
-    ...p,
-    mintAddressMode: 'random',
-    vanityMintPublicKey: '',
-  }, { readLaunches, saveLaunch, emit }, req.fundingKeypair!, sessionId).catch(err => {
-    console.error('[Launch] Relaunch fatal error:', err);
-  });
-});
-
-router.post('/', fundingMiddleware, async (req: FundingRequest, res: Response) => {
-  const {
-    tokenName,
-    tokenSymbol,
-    description = '',
-    imageUrl = '',
-    website = '',
-    twitter = '',
-    telegram = '',
-    devBuyAmount = 0.5,
-    bundleWalletCount = 0,
-    bundleSwapAmounts = [],
-    holderWalletCount = 0,
-    holderSwapAmounts = [],
-    holderAutoBuy = false,
-    holderAutoBuyDelay = 0,
-    useJito = true,
-    useLUT = false,
-    strictBundle = true,
-    mintAddressMode = 'random',
-    vanityMintPublicKey = '',
-    autoSellAfterLaunch = false,
-    devWalletId,
-    bundleWalletIds,
-    holderWalletIds,
-  } = req.body;
-
-  if (!tokenName || !tokenSymbol) {
-    return res.status(400).json({ error: 'tokenName and tokenSymbol required' });
-  }
-
-  const launchId = uuid();
-  const params = {
-    tokenName,
-    tokenSymbol,
-    description: description || '',
-    imageUrl: imageUrl || '',
-    website: website || '',
-    twitter: twitter || '',
-    telegram: telegram || '',
-    devBuyAmount,
-    bundleWalletCount,
-    bundleSwapAmounts,
-    holderWalletCount,
-    holderSwapAmounts,
-    holderAutoBuy,
-    holderAutoBuyDelay,
-    useJito,
-    useLUT,
-    strictBundle,
-    autoSellAfterLaunch,
-    mintAddressMode,
-    vanityMintPublicKey: vanityMintPublicKey || '',
-    devWalletId: devWalletId || undefined,
-    bundleWalletIds: bundleWalletIds || undefined,
-    holderWalletIds: holderWalletIds || undefined,
-  };
-  const launch: LaunchRecord = {
-    id: launchId,
-    tokenName,
-    tokenSymbol,
-    imageUrl: imageUrl || undefined,
-    status: 'pending',
-    createdAt: new Date().toISOString(),
-    params,
-  };
-  saveLaunch(launch);
-
-  res.json({ launchId, status: 'pending' });
-
-  const sessionId = (req.headers['x-session-id'] as string)?.trim();
-  executeLaunch(launchId, {
-    tokenName,
-    tokenSymbol,
-    description,
-    imageUrl,
-    website,
-    twitter,
-    telegram,
-    devBuyAmount,
-    bundleWalletCount,
-    bundleSwapAmounts,
-    holderWalletCount,
-    holderSwapAmounts,
-    holderAutoBuy,
-    holderAutoBuyDelay,
-    useJito,
-    useLUT,
-    strictBundle,
-    autoSellAfterLaunch,
-    mintAddressMode,
-    vanityMintPublicKey,
-    devWalletId: devWalletId || undefined,
-    bundleWalletIds: bundleWalletIds || undefined,
-    holderWalletIds: holderWalletIds || undefined,
-  }, { readLaunches, saveLaunch, emit }, req.fundingKeypair!, sessionId).catch(err => {
-    console.error('[Launch] Fatal error:', err);
   });
 });
 

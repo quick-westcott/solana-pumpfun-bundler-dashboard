@@ -2,12 +2,13 @@
   "name": "pump-launcher",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "scripts": {
-    "dev": "concurrently -n be,fe -c green,cyan \"npm run dev:backend\" \"wait-on http://localhost:3001/api/health -t 30000 && npm run dev:frontend\"",
+    "dev": "concurrently -n be,fe -c green,cyan \"npm run dev:backend\" \"wait-on http://localhost:3101/api/health -t 30000 && npm run dev:frontend\"",
     "dev:frontend": "cd frontend && npm run dev",
     "dev:backend": "cd backend && npm run dev",
     "install:all": "npm install --include=dev && cd frontend && npm install --include=dev && cd ../backend && npm install --include=dev",
-    "build": "npm run install:all && cd backend && npx tsc && cd ../frontend && npx tsc -b && npx vite build --outDir ../backend/public",
+    "build": "npm run install:all && cd backend && npx tsc && cd ../frontend && npx tsc -b && npx vite build --outDir ../backend/public --emptyOutDir",
     "start": "cd backend && node dist/index.js"
   },
   "devDependencies": {

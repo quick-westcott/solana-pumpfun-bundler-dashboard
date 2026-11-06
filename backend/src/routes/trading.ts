@@ -1,744 +1,169 @@
 import { Router, Request, Response } from 'express';
-import { fundingMiddleware, FundingRequest } from '../middleware/funding';
-import {
-  PublicKey, LAMPORTS_PER_SOL, SystemProgram,
-  TransactionMessage, VersionedTransaction,
-} from '@solana/web3.js';
-import { getAssociatedTokenAddressSync, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
-import BN from 'bn.js';
-import { OnlinePumpSdk } from '@pump-fun/pump-sdk';
+import { Keypair, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { requireFunding, type FundingRequest } from '../services/funding';
+import { findLaunch, findLaunchByMint, launchRole } from '../services/launches';
 import * as vault from '../services/vault';
-import * as solana from '../services/solana';
-import * as pumpfun from '../services/pumpfun';
-import { tracker, FormattedTrade } from '../services/pumpportal';
-import fs from 'fs';
-import path from 'path';
+import { trenchy, type Trenchy } from '../services/trenchy';
+import { tracker, ownTrade } from '../services/live-trades';
+import { assertBackedUp, isNotBackedUp, notBackedUpBody } from '../services/backup';
 
-function buildLiveTrade(opts: {
-  signature: string;
-  mint: string;
-  type: 'buy' | 'sell';
-  trader: string;
-  solAmount: number;
-  tokenAmount: number;
-  walletType: string | null;
-  walletLabel: string | null;
-}): FormattedTrade {
-  return {
-    signature: opts.signature,
-    mint: opts.mint,
-    type: opts.type,
-    trader: opts.trader,
-    traderShort: opts.trader ? `${opts.trader.slice(0, 4)}...${opts.trader.slice(-4)}` : '???',
-    solAmount: opts.solAmount,
-    tokenAmount: opts.tokenAmount,
-    marketCapSol: null,
-    timestamp: Date.now(),
-    isOurWallet: true,
-    walletType: opts.walletType,
-    walletLabel: opts.walletLabel,
-    pool: null,
-  };
-}
+// Every trade here is built by the TrenchyTools API (POST /api/sol/trade-local), signed with the wallet's key from
+// the local vault, and sent back through the API (POST /api/sol/send). pool "auto" follows a coin from the
+// pump.fun curve to PumpSwap after it graduates.
 
 const router = Router();
+const TRADE_PRIORITY_FEE_SOL = 0.0005;
+const MIN_SOL_FOR_SELL_TX = 0.005;
 
-// pump-swap-sdk logs noisy console.warn for TokenAccountNotFound — suppress it
-function suppressSdkWarns<T>(fn: () => Promise<T>): Promise<T> {
-  const orig = console.warn;
-  console.warn = (...args: unknown[]) => {
-    if (String(args[0] || '').includes('Error fetching token account')) return;
-    orig.apply(console, args);
-  };
-  return fn().finally(() => { console.warn = orig; });
-}
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-async function waitForSignatureConfirmation(
-  conn: ReturnType<typeof solana.getConnection>,
-  signature: string,
-  timeoutMs = 45_000,
-): Promise<boolean> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const status = (await conn.getSignatureStatuses([signature])).value[0];
-    if (status?.err) throw new Error(`Transaction failed: ${JSON.stringify(status.err)}`);
-    if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') {
-      return true;
-    }
-    await new Promise(r => setTimeout(r, 1500));
-  }
-  return false;
-}
-
-interface TradeRecord {
-  id: string;
-  type: 'buy' | 'sell';
-  mint: string;
-  walletId: string;
-  amount: number;
-  signature?: string;
-  status: 'pending' | 'confirmed' | 'error';
-  error?: string;
-  createdAt: string;
-}
-
-const TRADES_FILE = path.join(__dirname, '../../data/trades.json');
-
-function readTrades(): TradeRecord[] {
-  if (!fs.existsSync(TRADES_FILE)) return [];
-  return JSON.parse(fs.readFileSync(TRADES_FILE, 'utf8') || '[]');
-}
-
-function writeTrades(trades: TradeRecord[]) {
-  fs.writeFileSync(TRADES_FILE, JSON.stringify(trades, null, 2));
-}
-
-router.get('/history', (_req: Request, res: Response) => {
-  const trades = readTrades();
-  res.json(trades.slice(-100).reverse());
-});
-
+/** One wallet buys (amount = SOL) or sells (amount = tokens) a mint. */
 router.post('/execute', async (req: Request, res: Response) => {
-  const { type, mint, walletId, amount, slippage = 5 } = req.body;
-
-  if (!type || !mint || !walletId || !amount) {
-    return res.status(400).json({ error: 'type, mint, walletId, amount required' });
-  }
-
-  const trade: TradeRecord = {
-    id: crypto.randomUUID(),
-    type,
-    mint,
-    walletId,
-    amount: Number(amount),
-    status: 'pending',
-    createdAt: new Date().toISOString(),
-  };
-
+  const { type, mint, walletId, amount, slippage = 5 } = req.body ?? {};
+  if (!type || !mint || !walletId || !amount) return res.status(400).json({ error: 'type, mint, walletId, amount required' });
   try {
-    const sessionId = req.sessionId;
-    const keypair = await vault.getKeypair(walletId, sessionId);
-    const mintPubkey = new PublicKey(mint);
-    const conn = await solana.getConnectionForSession(sessionId);
-    const { blockhash } = await conn.getLatestBlockhash('confirmed');
-
-    let instructions;
-    if (type === 'buy') {
-      instructions = await pumpfun.buildBuyIxs({
-        mint: mintPubkey,
-        buyer: keypair.publicKey,
-        solAmount: Number(amount),
-      });
-    } else {
-      const tokenAmount = new BN(Math.round(Number(amount) * 1e6));
-      const sellResult = await pumpfun.buildSellIxs({
-        mint: mintPubkey,
-        seller: keypair.publicKey,
-        tokenAmount,
-      });
-      instructions = sellResult.instructions;
-    }
-
-    const tx = pumpfun.buildVersionedTx(keypair.publicKey, instructions, blockhash);
-    tx.sign([keypair]);
-
-    const sig = await conn.sendTransaction(tx, { skipPreflight: true });
-    await solana.confirmTransactionPolling(conn, sig);
-
-    trade.signature = sig;
-    trade.status = 'confirmed';
-
-    const trades = readTrades();
-    trades.push(trade);
-    writeTrades(trades);
-
-    const allWallets = await vault.listWallets({}, sessionId);
-    const walletInfo = allWallets.find(w => w.id === walletId);
-    tracker.injectTrade(buildLiveTrade({
-      signature: sig,
-      mint,
-      type,
-      trader: keypair.publicKey.toBase58(),
-      solAmount: Number(amount),
-      tokenAmount: type === 'sell' ? Number(amount) : 0,
-      walletType: walletInfo?.type || null,
-      walletLabel: walletInfo?.label || null,
-    }));
-
-    res.json(trade);
-  } catch (err: any) {
-    trade.status = 'error';
-    trade.error = err.message;
-
-    const trades = readTrades();
-    trades.push(trade);
-    writeTrades(trades);
-
-    res.status(500).json(trade);
-  }
-});
-
-const MIN_SOL_FOR_SELL_TX = 0.005; // ~5_000_000 lamports — need SOL for tx fees
-
-router.post('/rapid-sell', fundingMiddleware, async (req: FundingRequest, res: Response) => {
-  const { mint, percentage = 100, launchId, parallel = true, walletIds, walletTypes } = req.body;
-
-  if (!mint) return res.status(400).json({ error: 'mint required' });
-
-  console.log(`[RapidSell] mint=${mint?.slice(0, 8)}... pct=${percentage} walletIds=${JSON.stringify(walletIds)} launchId=${launchId}`);
-
-  const pct = Math.max(1, Math.min(100, Number(percentage) || 100));
-
-  const sessionId = req.sessionId;
-  const fundingKp = req.fundingKeypair ? solana.getFundingKeypair(req.fundingKeypair) : null;
-  let allWallets: vault.StoredWallet[];
-  if (walletIds && Array.isArray(walletIds) && walletIds.length > 0) {
-    const all = await vault.listWallets({ status: 'active' }, sessionId);
-    allWallets = all.filter(w => walletIds.includes(w.id));
-  } else if (walletTypes && Array.isArray(walletTypes) && walletTypes.length > 0) {
-    allWallets = [];
-    for (const t of walletTypes) {
-      allWallets.push(...(await vault.listWallets({ type: t, status: 'active' }, sessionId)));
-    }
-    if (launchId) {
-      allWallets = allWallets.filter(w => w.launchId === String(launchId));
-    }
-  } else {
-    const wallets = await vault.listWallets({ type: 'bundle', status: 'active' }, sessionId);
-    const devWallets = await vault.listWallets({ type: 'dev', status: 'active' }, sessionId);
-    const sniperWallets = await vault.listWallets({ type: 'sniper', status: 'active' }, sessionId);
-    allWallets = [...devWallets, ...wallets, ...sniperWallets];
-    if (launchId) {
-      allWallets = allWallets.filter(w => w.launchId === String(launchId));
-    }
-  }
-  const mintPubkey = new PublicKey(mint);
-  const conn = await solana.getConnectionForSession(sessionId);
-
-  if (allWallets.length === 0) {
-    console.log('[RapidSell] No wallets to process');
-    return res.json({ summary: { totalWallets: 0, confirmed: 0, sent: 0, skipped: 0, errors: 0 }, results: [] });
-  }
-
-  const processWallet = async (w: vault.StoredWallet) => {
-    try {
-      const keypair = await vault.getKeypair(w.id, sessionId);
-      const ata2022 = getAssociatedTokenAddressSync(
-        mintPubkey,
-        keypair.publicKey,
-        true,
-        TOKEN_2022_PROGRAM_ID,
-      );
-      const ataLegacy = getAssociatedTokenAddressSync(
-        mintPubkey,
-        keypair.publicKey,
-        true,
-        TOKEN_PROGRAM_ID,
-      );
-
-      const ataInfo2022 = await conn.getAccountInfo(ata2022);
-      const ataInfoLegacy = ataInfo2022 ? null : await conn.getAccountInfo(ataLegacy);
-      const ata = ataInfo2022 ? ata2022 : (ataInfoLegacy ? ataLegacy : null);
-
-      if (!ata) {
-        return { wallet: w.publicKey, status: 'skipped', reason: 'no token account' };
-      }
-
-      let balance;
-      try {
-        balance = await conn.getTokenAccountBalance(ata);
-      } catch {
-        return { wallet: w.publicKey, status: 'skipped', reason: 'token account closed or not found' };
-      }
-      const tokenBalance = balance.value.amount;
-
-      if (tokenBalance === '0') {
-        return { wallet: w.publicKey, status: 'skipped', reason: 'zero balance' };
-      }
-
-      const sellAmount = new BN(tokenBalance).muln(pct).divn(100);
-      if (sellAmount.lten(0)) {
-        return { wallet: w.publicKey, status: 'skipped', reason: 'sell amount is zero' };
-      }
-
-      // Auto-fund if wallet has no SOL (e.g. after "Recover SOL" / gather left tokens but drained SOL)
-      const solBalance = await conn.getBalance(keypair.publicKey);
-      const solBalanceSol = solBalance / LAMPORTS_PER_SOL;
-      if (solBalanceSol < MIN_SOL_FOR_SELL_TX && fundingKp) {
-        try {
-          await solana.transferSol(fundingKp, keypair.publicKey, 0.01, { conn });
-          console.log(`[RapidSell] Auto-funded ${w.publicKey.slice(0, 8)}... with 0.01 SOL (had ${solBalanceSol.toFixed(6)})`);
-          await new Promise(r => setTimeout(r, 500)); // Brief delay for balance to propagate
-        } catch (fundErr: unknown) {
-          const msg = fundErr instanceof Error ? fundErr.message : String(fundErr);
-          return { wallet: w.publicKey, status: 'error', error: `Insufficient SOL for fees. Fund wallet first: ${msg}` };
-        }
-      } else if (solBalanceSol < MIN_SOL_FOR_SELL_TX && !fundingKp) {
-        return { wallet: w.publicKey, status: 'error', error: 'Insufficient SOL for tx fees. Use "Fund 0.01 SOL" or configure funding wallet.' };
-      }
-
-      let instructions;
-      let expectedSolOut;
-      try {
-        const sellResult = await pumpfun.buildSellIxs({
-          mint: mintPubkey,
-          seller: keypair.publicKey,
-          tokenAmount: sellAmount,
-        });
-        instructions = sellResult.instructions;
-        expectedSolOut = sellResult.solAmount;
-      } catch (sellErr: any) {
-        const msg = sellErr?.message || String(sellErr);
-        console.error(`[RapidSell] buildSellIxs failed for ${w.publicKey.slice(0, 8)}...: ${msg}`);
-        const isGraduated = /bonding curve|sell state|graduated|closed|invalid/i.test(msg);
-        return {
-          wallet: w.publicKey,
-          status: 'error',
-          error: isGraduated
-            ? 'Token may have graduated to Raydium. Sell on pump.fun or via Jupiter/Raydium instead.'
-            : msg,
-        };
-      }
-
-      const { blockhash } = await conn.getLatestBlockhash('confirmed');
-      const tx = pumpfun.buildVersionedTx(keypair.publicKey, instructions!, blockhash);
-      tx.sign([keypair]);
-
-      const sig = await conn.sendTransaction(tx, { skipPreflight: true });
-
-      tracker.injectTrade(buildLiveTrade({
-        signature: sig,
-        mint,
-        type: 'sell',
-        trader: keypair.publicKey.toBase58(),
-        solAmount: expectedSolOut!.toNumber() / 1e9,
-        tokenAmount: Number(sellAmount.toString()) / 1e6,
-        walletType: w.type,
-        walletLabel: w.label,
-      }));
-
-      const confirmed = await waitForSignatureConfirmation(conn, sig, 45_000);
-      if (confirmed) {
-        return { wallet: w.publicKey, status: 'confirmed', signature: sig, soldRaw: sellAmount.toString() };
-      }
-      return { wallet: w.publicKey, status: 'sent', signature: sig, soldRaw: sellAmount.toString() };
-    } catch (err: any) {
-      return { wallet: w.publicKey, status: 'error', error: err.message };
-    }
-  };
-
-  const results = parallel
-    ? await Promise.all(allWallets.map(w => processWallet(w)))
-    : await (async () => {
-        const seqResults: Awaited<ReturnType<typeof processWallet>>[] = [];
-        for (const w of allWallets) {
-          seqResults.push(await processWallet(w));
-          await new Promise(r => setTimeout(r, 250));
-        }
-        return seqResults;
-      })();
-
-  const typedResults = results.filter(Boolean) as Array<{ wallet: string; status: string; signature?: string; soldRaw?: string; reason?: string; error?: string }>;
-
-  const summary = {
-    totalWallets: allWallets.length,
-    confirmed: typedResults.filter(r => r.status === 'confirmed').length,
-    sent: typedResults.filter(r => r.status === 'sent').length,
-    skipped: typedResults.filter(r => r.status === 'skipped').length,
-    errors: typedResults.filter(r => r.status === 'error').length,
-  };
-
-  const errResults = typedResults.filter(r => r.status === 'error');
-  if (errResults.length > 0) {
-    const msgs = errResults.map(r => r.error).filter(Boolean);
-    console.log(`[RapidSell] Errors: ${msgs.join('; ')}`);
-  }
-
-  res.json({ summary, results: typedResults });
-});
-
-function findLaunchByMint(mint: string): { id: string } | undefined {
-  const file = path.join(__dirname, '../../data/launches.json');
-  if (!fs.existsSync(file)) return undefined;
-  try {
-    const launches = JSON.parse(fs.readFileSync(file, 'utf8') || '[]');
-    return launches.find((l: { mintAddress?: string }) => l.mintAddress === mint);
-  } catch { return undefined; }
-}
-
-/** Get unclaimed creator fees for a launch (read-only, no claim). */
-router.get('/creator-fees-available', async (req: Request, res: Response) => {
-  let launchId = req.query.launchId as string;
-  const mint = req.query.mint as string;
-  if (!launchId && mint) {
-    const launch = findLaunchByMint(mint);
-    if (launch) launchId = launch.id;
-  }
-  if (!launchId) return res.status(400).json({ error: 'launchId or mint query param required' });
-
-  const sessionId = req.sessionId;
-  const devWallets = (await vault.listWallets({ type: 'dev' }, sessionId)).filter(w => w.launchId === String(launchId));
-  if (devWallets.length === 0) {
-    return res.status(404).json({ error: `No dev wallet found for launchId ${launchId}` });
-  }
-
-  const devWallet = devWallets.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
-  const keypair = await vault.getKeypair(devWallet.id, sessionId);
-  const conn = await solana.getConnectionForSession(sessionId);
-  const sdk = new OnlinePumpSdk(conn);
-
-  const balance = await suppressSdkWarns(() => sdk.getCreatorVaultBalanceBothPrograms(keypair.publicKey));
-  const availableSol = Number(balance.toString()) / LAMPORTS_PER_SOL;
-  const devSolBalance = await conn.getBalance(keypair.publicKey);
-  const devSol = devSolBalance / LAMPORTS_PER_SOL;
-
-  return res.json({
-    launchId,
-    availableSol,
-    availableLamports: balance.toString(),
-    creator: keypair.publicKey.toBase58(),
-    devSol,
-  });
-});
-
-const FUND_AMOUNT_LAMPORTS = 1_500_000; // ~0.0015 SOL — covers rent-exemption + tx fee
-
-router.post('/collect-creator-fees', fundingMiddleware, async (req: FundingRequest, res: Response) => {
-  let { launchId, mint } = req.body;
-  if (!launchId && mint) {
-    const launch = findLaunchByMint(mint);
-    if (launch) launchId = launch.id;
-  }
-  if (!launchId) return res.status(400).json({ error: 'launchId or mint required' });
-
-  try {
-    tracker.unsubscribeCurrentMint();
-
-    const sessionId = req.sessionId;
-    const devWallets = (await vault.listWallets({ type: 'dev' }, sessionId)).filter(w => w.launchId === String(launchId));
-    if (devWallets.length === 0) {
-      return res.status(404).json({ error: `No dev wallet found for launch ${launchId}. Ensure you're on the correct launch — select it from Launch History or paste the mint.` });
-    }
-
-    // Use the dev wallet that created this launch (newest by createdAt for this launchId)
-    const devWallet = devWallets.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
-    const keypair = await vault.getKeypair(devWallet.id, sessionId);
-    const conn = await solana.getConnectionForSession(sessionId);
-    const sdk = new OnlinePumpSdk(conn);
-    const fundingKp = solana.getFundingKeypair(req.fundingKeypair);
-    let fundedFromFunding = false;
-
-    const beforeVault = await suppressSdkWarns(() => sdk.getCreatorVaultBalanceBothPrograms(keypair.publicKey));
-    if (beforeVault.lten(0)) {
-      return res.json({
-        status: 'skipped',
-        reason: 'No creator fees available',
-        creator: keypair.publicKey.toBase58(),
-        launchId,
-      });
-    }
-
-    const ixs = await sdk.collectCoinCreatorFeeInstructions(keypair.publicKey);
-    if (!ixs.length) {
-      return res.json({
-        status: 'skipped',
-        reason: 'No collect instructions available',
-        creator: keypair.publicKey.toBase58(),
-        launchId,
-      });
-    }
-
-    // If dev wallet has no SOL, fund it from the funding wallet first
-    const devBalance = await conn.getBalance(keypair.publicKey);
-    if (devBalance < FUND_AMOUNT_LAMPORTS) {
-      const fundAmount = FUND_AMOUNT_LAMPORTS - devBalance + TX_FEE_LAMPORTS;
-      const { blockhash: bh } = await conn.getLatestBlockhash('confirmed');
-      const fundMsg = new TransactionMessage({
-        payerKey: fundingKp.publicKey,
-        recentBlockhash: bh,
-        instructions: [
-          SystemProgram.transfer({
-            fromPubkey: fundingKp.publicKey,
-            toPubkey: keypair.publicKey,
-            lamports: fundAmount,
-          }),
-        ],
-      }).compileToV0Message();
-      const fundTx = new VersionedTransaction(fundMsg);
-      fundTx.sign([fundingKp]);
-      const fundSig = await conn.sendTransaction(fundTx, { skipPreflight: true });
-      const fundOk = await waitForSignatureConfirmation(conn, fundSig, 30_000);
-      if (!fundOk) {
-        return res.status(500).json({ status: 'error', error: 'Failed to fund dev wallet for fee collection' });
-      }
-      fundedFromFunding = true;
-      console.log(`[CollectFees] Funded dev ${keypair.publicKey.toBase58().slice(0, 8)}... with ${fundAmount} lamports from funding`);
-    }
-
-    // Collect creator fees
-    const { blockhash } = await conn.getLatestBlockhash('confirmed');
-    const tx = pumpfun.buildVersionedTx(keypair.publicKey, ixs, blockhash);
-    tx.sign([keypair]);
-
-    const sig = await conn.sendTransaction(tx, { skipPreflight: true });
-    const confirmed = await waitForSignatureConfirmation(conn, sig, 45_000);
-    if (!confirmed) {
-      return res.status(500).json({
-        status: 'error',
-        error: 'Creator fee collect tx not confirmed in time',
-        signature: sig,
-        creator: keypair.publicKey.toBase58(),
-        launchId,
-      });
-    }
-
-    const collectedSol = Number(beforeVault.toString()) / LAMPORTS_PER_SOL;
-
-    // Sweep collected fees + any remaining SOL back to funding wallet
-    let sweptSol = 0;
-    let sweepSig: string | undefined;
-    try {
-      await new Promise(r => setTimeout(r, 1000));
-      const devLamportsAfter = await conn.getBalance(keypair.publicKey);
-      const sweepLamports = devLamportsAfter - TX_FEE_LAMPORTS;
-      if (sweepLamports > 0) {
-        const { blockhash: bh2 } = await conn.getLatestBlockhash('confirmed');
-        const sweepMsg = new TransactionMessage({
-          payerKey: keypair.publicKey,
-          recentBlockhash: bh2,
-          instructions: [
-            SystemProgram.transfer({
-              fromPubkey: keypair.publicKey,
-              toPubkey: fundingKp.publicKey,
-              lamports: sweepLamports,
-            }),
-          ],
-        }).compileToV0Message();
-        const sweepTx = new VersionedTransaction(sweepMsg);
-        sweepTx.sign([keypair]);
-        sweepSig = await conn.sendTransaction(sweepTx, { skipPreflight: true });
-        sweptSol = sweepLamports / LAMPORTS_PER_SOL;
-        console.log(`[CollectFees] Swept ${sweptSol.toFixed(6)} SOL → funding`);
-      }
-    } catch (err: unknown) {
-      console.error('[CollectFees] Sweep failed:', err instanceof Error ? err.message : err);
-    }
-
-    res.json({
-      status: 'confirmed',
-      signature: sig,
-      creator: keypair.publicKey.toBase58(),
-      launchId,
-      collectedSol,
-      sweptSol,
-      sweepSig,
-      fundedFromFunding,
+    const api = trenchy();
+    const w = vault.getWallet(String(walletId));
+    if (!w) return res.status(404).json({ error: 'Wallet not found' });
+    const keypair = vault.getKeypair(w.id);
+    const built = await api.tradeLocal({
+      publicKey: keypair.publicKey.toBase58(), action: type === 'buy' ? 'buy' : 'sell', mint, amount: Number(amount),
+      denominatedInSol: type === 'buy' ? 'true' : 'false', slippage: Number(slippage) || 5, priorityFee: TRADE_PRIORITY_FEE_SOL, pool: 'auto',
     });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error('[CollectFees] Error:', msg);
-    res.status(500).json({ status: 'error', error: msg, launchId });
+    const signature = await api.execute(built.tx, [keypair], 45_000);
+    tracker.injectTrade(ownTrade(mint, type === 'buy' ? 'buy' : 'sell', keypair.publicKey.toBase58(), built.expected.sol, built.expected.tokens, w.type, w.label, signature));
+    res.json({ signature, expected: built.expected, status: 'confirmed' });
+  } catch (err) {
+    res.status(500).json({ error: errMsg(err) });
   }
 });
 
-// ── Collect fees from all old launches ──────────────────────────
+/**
+ * Sell a percentage from many wallets at once: { mint, percentage, walletIds? | launchId? }. Without walletIds, every
+ * dev / bundle / holder wallet of the launch. A wallet with no SOL for the fee is topped up from the funding wallet
+ * first (which is why the funding wallet, and that wallet's backup, are required here).
+ */
+router.post('/rapid-sell', requireFunding, async (req: FundingRequest, res: Response) => {
+  const { mint, percentage = 100, launchId, walletIds } = req.body ?? {};
+  if (!mint) return res.status(400).json({ error: 'mint required' });
+  const pct = Math.max(1, Math.min(100, Number(percentage) || 100));
+  const api = trenchy();
+  const fundingKp = req.fundingKeypair!;
 
-const LAUNCHES_FILE = path.join(__dirname, '../../data/launches.json');
+  let wallets: vault.StoredWallet[];
+  if (Array.isArray(walletIds) && walletIds.length > 0) {
+    wallets = vault.listWallets().filter(w => walletIds.includes(w.id));
+  } else {
+    const launch = (launchId ? findLaunch(String(launchId)) : null) ?? findLaunchByMint(String(mint));
+    wallets = vault.listWallets({ status: 'active', launchId: launch?.id }).filter(w => launch && launchRole(w, launch));
+  }
+  if (!wallets.length) return res.json({ summary: { totalWallets: 0, confirmed: 0, sent: 0, skipped: 0, errors: 0 }, results: [] });
 
-interface LaunchRecord {
-  id: string;
-  tokenName: string;
-  tokenSymbol: string;
-  mintAddress?: string;
-  imageUrl?: string;
-  status: string;
-  createdAt: string;
-}
+  let balances: Map<string, { sol: number; raw: string }>;
+  try {
+    balances = new Map((await api.balances(wallets.map(w => w.publicKey), mint)).map(b => [b.wallet, { sol: b.sol, raw: b.token?.raw ?? '0' }]));
+  } catch (err) {
+    return res.status(502).json({ error: `Could not read balances: ${errMsg(err)}` });
+  }
 
-function readLaunches(): LaunchRecord[] {
-  if (!fs.existsSync(LAUNCHES_FILE)) return [];
-  try { return JSON.parse(fs.readFileSync(LAUNCHES_FILE, 'utf8') || '[]'); } catch { return []; }
-}
-
-router.get('/all-unclaimed-fees', async (req: Request, res: Response) => {
-  const launches = readLaunches().filter(l => l.status === 'confirmed' && l.mintAddress);
-  const sessionId = req.sessionId;
-  const conn = await solana.getConnectionForSession(sessionId);
-  const sdk = new OnlinePumpSdk(conn);
-
-  const results: {
-    launchId: string;
-    tokenName: string;
-    tokenSymbol: string;
-    mintAddress: string;
-    creator: string;
-    availableSol: number;
-    createdAt: string;
-  }[] = [];
-  for (const launch of launches) {
-    const devWallets = (await vault.listWallets({ type: 'dev' }, sessionId)).filter(w => w.launchId === launch.id);
-    if (devWallets.length === 0) continue;
-
-    const devWallet = devWallets.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+  const results = await Promise.all(wallets.map(async w => {
     try {
-      const keypair = await vault.getKeypair(devWallet.id, sessionId);
-      const balance = await suppressSdkWarns(() => sdk.getCreatorVaultBalanceBothPrograms(keypair.publicKey));
-      const availableSol = Number(balance.toString()) / LAMPORTS_PER_SOL;
-      results.push({
-        launchId: launch.id,
-        tokenName: launch.tokenName,
-        tokenSymbol: launch.tokenSymbol,
-        mintAddress: launch.mintAddress!,
-        creator: keypair.publicKey.toBase58(),
-        availableSol,
-        createdAt: launch.createdAt,
-      });
-    } catch {
-      // RPC fetch failed / rate limit — skip, don't spam logs
+      const bal = balances.get(w.publicKey);
+      if (!bal || bal.raw === '0') return { wallet: w.publicKey, status: 'skipped', reason: 'zero balance' };
+      const keypair = vault.getKeypair(w.id);
+      if (bal.sol < MIN_SOL_FOR_SELL_TX && !keypair.publicKey.equals(fundingKp.publicKey)) {
+        assertBackedUp(w.publicKey);   // SOL moves into it: the backup rule applies
+        await api.transferSol(fundingKp, keypair.publicKey, 0.01);
+      }
+      const built = await api.tradeLocal({ publicKey: w.publicKey, action: 'sell', mint, amount: `${pct}%`, denominatedInSol: 'false', slippage: 15, priorityFee: TRADE_PRIORITY_FEE_SOL, pool: 'auto' });
+      built.tx.sign([keypair]);
+      const { signature } = await api.send(built.tx);
+      tracker.injectTrade(ownTrade(mint, 'sell', w.publicKey, built.expected.sol, built.expected.tokens, w.type, w.label, signature));
+      const confirmed = await api.waitConfirmed(signature, 45_000);
+      return { wallet: w.publicKey, status: confirmed ? 'confirmed' : 'sent', signature };
+    } catch (err) {
+      return { wallet: w.publicKey, status: 'error', error: isNotBackedUp(err) ? notBackedUpBody(err).error : errMsg(err), ...(isNotBackedUp(err) ? { code: err.code } : {}) };
     }
-    // Delay to avoid RPC rate limits (500ms between requests)
-    await new Promise(r => setTimeout(r, 500));
-  }
+  }));
 
-  res.json(results);
+  const count = (s: string) => results.filter(r => r.status === s).length;
+  res.json({ summary: { totalWallets: wallets.length, confirmed: count('confirmed'), sent: count('sent'), skipped: count('skipped'), errors: count('error') }, results });
 });
 
+/** The dev wallet that created a launch. */
+function devWalletFor(launchId: string): vault.StoredWallet | null {
+  const launch = findLaunch(launchId);
+  const byType = vault.listWallets({ type: 'dev', launchId }).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+  if (byType) return byType;
+  return launch?.params?.devWalletId ? vault.getWallet(launch.params.devWalletId) : null;
+}
+
+const resolveLaunchId = (launchId: unknown, mint: unknown): string | null =>
+  (typeof launchId === 'string' && launchId) || (typeof mint === 'string' && findLaunchByMint(mint)?.id) || null;
+
+/** Unclaimed creator fees for a launch (read-only). */
+router.get('/creator-fees', async (req: Request, res: Response) => {
+  const launchId = resolveLaunchId(req.query.launchId, req.query.mint);
+  if (!launchId) return res.status(400).json({ error: 'launchId or mint required (only your own launches have a dev wallet here)' });
+  const dev = devWalletFor(launchId);
+  if (!dev) return res.status(404).json({ error: 'No dev wallet found for this launch' });
+  try {
+    const api = trenchy();
+    const [fees, devSol] = await Promise.all([api.creatorFees(dev.publicKey), api.solBalance(dev.publicKey)]);
+    res.json({ launchId, creator: dev.publicKey, availableSol: fees.sol, availableLamports: fees.lamports, devSol });
+  } catch (err) {
+    res.status(502).json({ error: errMsg(err) });
+  }
+});
+
+const FUND_AMOUNT_LAMPORTS = 1_500_000;   // ~0.0015 SOL: rent exemption + the claim's fee
 const TX_FEE_LAMPORTS = 5000;
 
-router.post('/collect-all-fees', fundingMiddleware, async (req: FundingRequest, res: Response) => {
-  const { launchIds } = req.body;
-  if (!Array.isArray(launchIds) || launchIds.length === 0) {
-    return res.status(400).json({ error: 'launchIds array required' });
+/** Claim the dev wallet's creator fees (action collectCreatorFee), then sweep the dev wallet to funding. */
+async function collectAndSweep(api: Trenchy, dev: Keypair, fundingKp: Keypair) {
+  const fees = await api.creatorFees(dev.publicKey.toBase58());
+  if (fees.lamports === '0') return { status: 'skipped' as const, collectedSol: 0, reason: 'No creator fees available' };
+
+  let fundedFromFunding = false;
+  const devLamports = Math.round((await api.solBalance(dev.publicKey)) * LAMPORTS_PER_SOL);
+  if (devLamports < FUND_AMOUNT_LAMPORTS) {
+    assertBackedUp(dev.publicKey.toBase58());
+    await api.transferSol(fundingKp, dev.publicKey, 0, { lamports: FUND_AMOUNT_LAMPORTS - devLamports + TX_FEE_LAMPORTS });
+    fundedFromFunding = true;
   }
 
-  const sessionId = req.sessionId;
-  const conn = await solana.getConnectionForSession(sessionId);
-  const sdk = new OnlinePumpSdk(conn);
-  const fundingKp = solana.getFundingKeypair(req.fundingKeypair!);
+  const built = await api.tradeLocal({ publicKey: dev.publicKey.toBase58(), action: 'collectCreatorFee', priorityFee: 0.0001 });
+  built.tx.sign([dev]);
+  const { signature } = await api.send(built.tx);
+  if (!(await api.waitConfirmed(signature, 45_000))) return { status: 'error' as const, signature, error: 'Creator fee claim not confirmed in time' };
 
-  const results: {
-    launchId: string;
-    status: string;
-    collectedSol?: number;
-    sweptSol?: number;
-    signature?: string;
-    sweepSig?: string;
-    error?: string;
-  }[] = [];
-
-  for (const launchId of launchIds) {
-    const devWallets = (await vault.listWallets({ type: 'dev' }, sessionId)).filter(w => w.launchId === String(launchId));
-    if (devWallets.length === 0) {
-      results.push({ launchId, status: 'skipped', error: 'No dev wallet found' });
-      continue;
+  let sweptSol = 0;
+  let sweepSig: string | undefined;
+  try {
+    await new Promise(r => setTimeout(r, 1000));
+    const sweepLamports = Math.round((await api.solBalance(dev.publicKey)) * LAMPORTS_PER_SOL) - TX_FEE_LAMPORTS;
+    if (sweepLamports > 0) {
+      sweepSig = await api.transferSol(dev, fundingKp.publicKey, 0, { lamports: sweepLamports, confirm: false });
+      sweptSol = sweepLamports / LAMPORTS_PER_SOL;
     }
-
-    const devWallet = devWallets.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
-    try {
-      const keypair = await vault.getKeypair(devWallet.id, sessionId);
-
-      // 1) Collect creator fees → goes to the dev wallet
-      const vaultBal = await suppressSdkWarns(() => sdk.getCreatorVaultBalanceBothPrograms(keypair.publicKey));
-      if (vaultBal.lten(0)) {
-        results.push({ launchId, status: 'skipped', collectedSol: 0, error: 'No fees to collect' });
-        continue;
-      }
-
-      const ixs = await sdk.collectCoinCreatorFeeInstructions(keypair.publicKey);
-      if (!ixs.length) {
-        results.push({ launchId, status: 'skipped', collectedSol: 0, error: 'No collect instructions' });
-        continue;
-      }
-
-      // Fund dev wallet from funding if it can't pay for the collect tx
-      const devBalance = await conn.getBalance(keypair.publicKey);
-      if (devBalance < FUND_AMOUNT_LAMPORTS) {
-        const fundAmount = FUND_AMOUNT_LAMPORTS - devBalance + TX_FEE_LAMPORTS;
-        const { blockhash: fbh } = await conn.getLatestBlockhash('confirmed');
-        const fundMsg = new TransactionMessage({
-          payerKey: fundingKp.publicKey,
-          recentBlockhash: fbh,
-          instructions: [
-            SystemProgram.transfer({
-              fromPubkey: fundingKp.publicKey,
-              toPubkey: keypair.publicKey,
-              lamports: fundAmount,
-            }),
-          ],
-        }).compileToV0Message();
-        const fundTx = new VersionedTransaction(fundMsg);
-        fundTx.sign([fundingKp]);
-        const fundSig = await conn.sendTransaction(fundTx, { skipPreflight: true });
-        const fundOk = await waitForSignatureConfirmation(conn, fundSig, 30_000);
-        if (!fundOk) {
-          results.push({ launchId, status: 'error', error: 'Failed to fund dev wallet' });
-          continue;
-        }
-        console.log(`[CollectAll] Funded dev ${keypair.publicKey.toBase58().slice(0, 8)}... with ${fundAmount} lamports`);
-      }
-
-      const { blockhash } = await conn.getLatestBlockhash('confirmed');
-      const collectTx = pumpfun.buildVersionedTx(keypair.publicKey, ixs, blockhash);
-      collectTx.sign([keypair]);
-      const collectSig = await conn.sendTransaction(collectTx, { skipPreflight: true });
-
-      const collectConfirmed = await waitForSignatureConfirmation(conn, collectSig, 45_000);
-      if (!collectConfirmed) {
-        results.push({ launchId, status: 'error', signature: collectSig, error: 'Collect tx not confirmed' });
-        continue;
-      }
-
-      const collectedSol = Number(vaultBal.toString()) / LAMPORTS_PER_SOL;
-      console.log(`[CollectAll] ${launchId.slice(0, 8)}... collected ${collectedSol.toFixed(6)} SOL`);
-
-      // 2) Sweep the dev wallet SOL → funding wallet
-      await new Promise(r => setTimeout(r, 1000));
-      const devLamports = await conn.getBalance(keypair.publicKey);
-      const sendLamports = devLamports - TX_FEE_LAMPORTS;
-
-      let sweptSol = 0;
-      let sweepSig: string | undefined;
-      if (sendLamports > 0) {
-        const { blockhash: bh2 } = await conn.getLatestBlockhash('confirmed');
-        const sweepMsg = new TransactionMessage({
-          payerKey: keypair.publicKey,
-          recentBlockhash: bh2,
-          instructions: [
-            SystemProgram.transfer({
-              fromPubkey: keypair.publicKey,
-              toPubkey: fundingKp.publicKey,
-              lamports: sendLamports,
-            }),
-          ],
-        }).compileToV0Message();
-
-        const sweepTx = new VersionedTransaction(sweepMsg);
-        sweepTx.sign([keypair]);
-        sweepSig = await conn.sendTransaction(sweepTx, { skipPreflight: true });
-        sweptSol = sendLamports / LAMPORTS_PER_SOL;
-        console.log(`[CollectAll] ${launchId.slice(0, 8)}... swept ${sweptSol.toFixed(6)} SOL → funding`);
-      }
-
-      results.push({
-        launchId,
-        status: 'confirmed',
-        collectedSol,
-        sweptSol,
-        signature: collectSig,
-        sweepSig,
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[CollectAll] ${launchId.slice(0, 8)}... failed:`, msg);
-      results.push({ launchId, status: 'error', error: msg });
-    }
-
-    await new Promise(r => setTimeout(r, 300));
+  } catch (err) {
+    console.error('[fees] sweep failed:', errMsg(err));
   }
+  return { status: 'confirmed' as const, signature, collectedSol: fees.sol, sweptSol, sweepSig, fundedFromFunding };
+}
 
-  const totalCollected = results.reduce((s, r) => s + (r.collectedSol || 0), 0);
-  const totalSwept = results.reduce((s, r) => s + (r.sweptSol || 0), 0);
-  res.json({ totalCollected, totalSwept, results });
+router.post('/collect-creator-fees', requireFunding, async (req: FundingRequest, res: Response) => {
+  const launchId = resolveLaunchId(req.body?.launchId, req.body?.mint);
+  if (!launchId) return res.status(400).json({ error: 'launchId or mint required' });
+  const dev = devWalletFor(launchId);
+  if (!dev) return res.status(404).json({ error: 'No dev wallet found for this launch' });
+  try {
+    const r = await collectAndSweep(trenchy(), vault.getKeypair(dev.id), req.fundingKeypair!);
+    res.status(r.status === 'error' ? 500 : 200).json({ ...r, creator: dev.publicKey, launchId });
+  } catch (err) {
+    if (isNotBackedUp(err)) return res.status(409).json(notBackedUpBody(err));
+    res.status(500).json({ status: 'error', error: errMsg(err), launchId });
+  }
 });
 
 export default router;

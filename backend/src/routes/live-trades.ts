@@ -1,51 +1,21 @@
 import { Router, Request, Response } from 'express';
-import { tracker, FormattedTrade } from '../services/pumpportal';
+import { tracker, type FormattedTrade } from '../services/live-trades';
 
 const router = Router();
 
-// Pre-subscribe to a mint (for vanity addresses or manual tracking before launch)
-router.post('/presubscribe', async (req: Request, res: Response) => {
-  const { mint } = req.body;
-  if (!mint || typeof mint !== 'string' || mint.length < 32) {
-    return res.status(400).json({ error: 'valid mint address required' });
-  }
-  await tracker.subscribe(mint, undefined, req.sessionId || undefined);
-  res.json({ status: 'subscribed', mint });
-});
-
-router.get('/', async (req: Request, res: Response) => {
+/** Server-sent events: the cached trades for a mint, then every new one from the API websocket. */
+router.get('/', (req: Request, res: Response) => {
   const mint = String(req.query.mint || '');
-  if (!mint) return res.status(400).json({ error: 'mint query param required' });
-  // EventSource cannot send custom headers; use sessionId from query as fallback
-  const sessionId = (req.headers['x-session-id'] as string)?.trim()
-    || (typeof req.query.sessionId === 'string' ? req.query.sessionId.trim() : undefined);
+  if (!mint || mint.length < 32) return res.status(400).json({ error: 'mint query param required' });
 
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
-  });
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  tracker.subscribe(mint);
+  setTimeout(() => { try { res.write(`data: ${JSON.stringify({ type: 'initial', trades: tracker.getTrades() })}\n\n`); } catch { /* closed */ } }, 500);
 
-  await tracker.subscribe(mint, undefined, sessionId || undefined);
-
-  // Small delay to let any cached trades arrive
-  setTimeout(() => {
-    const cached = tracker.getTrades();
-    res.write(`data: ${JSON.stringify({ type: 'initial', trades: cached })}\n\n`);
-  }, 500);
-
-  const onTrade = (trade: FormattedTrade) => {
-    try {
-      res.write(`data: ${JSON.stringify({ type: 'trade', trade })}\n\n`);
-    } catch {}
-  };
-
+  const onTrade = (trade: FormattedTrade) => { try { res.write(`data: ${JSON.stringify({ type: 'trade', trade })}\n\n`); } catch { /* closed */ } };
   tracker.addListener(onTrade);
-
-  req.on('close', () => {
-    tracker.removeListener(onTrade);
-  });
+  const keepalive = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* closed */ } }, 15_000);
+  req.on('close', () => { clearInterval(keepalive); tracker.removeListener(onTrade); });
 });
 
 export default router;

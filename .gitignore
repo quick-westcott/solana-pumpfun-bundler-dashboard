@@ -19,3 +19,4 @@ Thumbs.db
 # Build artifacts
 *.tsbuildinfo
 backend/public/
+!.env.example

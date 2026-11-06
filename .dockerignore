@@ -1,0 +1,12 @@
+node_modules
+*/node_modules
+backend/dist
+backend/public
+backend/data
+backend/keys
+backend/.env
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+.git

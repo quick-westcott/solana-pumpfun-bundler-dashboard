@@ -1,973 +1,361 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import axios from 'axios'
-import { PhotoIcon, SparklesIcon } from '@heroicons/react/24/outline'
+import { PhotoIcon } from '@heroicons/react/24/outline'
 import Tip from '../components/ui/Tip'
+import { Busy } from '../components/ui/Spinner'
+import type { Wallet } from '../types'
+import { errorMessage, links, short } from '../types'
 
-interface LaunchForm {
-  tokenName: string
-  tokenSymbol: string
-  description: string
-  imageUrl: string
-  website: string
-  twitter: string
-  telegram: string
+interface Form {
+  tokenName: string; tokenSymbol: string; description: string; imageUrl: string
+  twitter: string; telegram: string; website: string
   devBuyAmount: number
-  bundleWalletCount: number
-  bundleSwapAmounts: number[]
-  holderWalletCount: number
-  holderSwapAmounts: number[]
-  holderAutoBuy: boolean
-  holderAutoBuyDelay: number
-  useJito: boolean
-  useLUT: boolean
-  strictBundle: boolean
-  autoSellAfterLaunch: boolean
+  bundleWalletCount: number; bundleSwapAmounts: number[]; bundleWalletIds: (string | null)[]
+  holderWalletCount: number; holderSwapAmounts: number[]; holderWalletIds: (string | null)[]
+  holderAutoBuy: boolean; holderAutoBuyDelay: number
+  useJito: boolean; strictBundle: boolean; autoSellAfterLaunch: boolean
   mintAddressMode: 'random' | 'vanity'
-  vanityMintPublicKey: string
-  devWalletId: string
-  bundleWalletIds: (string | null)[]
-  holderWalletIds: (string | null)[]
 }
 
-interface AvailableWallet {
-  id: string
-  publicKey: string
-  type: string
-  label: string
+interface Plan { tipSol: number; useLut: boolean; dev: number; bundle: number[]; holder: number[]; total: number }
+
+interface VanityPool {
+  available: number; total: number; generating: boolean; collecting?: boolean
+  stats?: { attempts: number; expectedAttempts: number; progress: number; found: number; rate: number; suffix: string; lastError: string | null } | null
 }
 
-interface VanityPoolStatus {
-  available: number
-  used: number
-  total: number
-  generating: boolean
-  stats?: { checked: number; found: number; elapsed: number; rate: number } | null
-}
+interface Stage { stage: string; message: string; at: number }
+interface SimResult { ok: boolean; checks: Array<{ name: string; ok: boolean; detail: string }>; cost: Plan; simulation: { ok: boolean; unitsConsumed: number | null; err: unknown; logs: string[] } | null }
 
-interface VanityAddress {
-  publicKey: string
-  suffix: string
-  status: 'available' | 'used'
-  createdAt: string
-}
-
-interface LaunchProfileSummary {
-  id: string
-  name: string
-  createdAt: string
-  tokenName: string
-  tokenSymbol: string
-}
-
-const fmtNum = (n: number) => {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M'
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
-  return String(n)
-}
-
-const DEV_PRESETS = [0.1, 0.2, 0.25, 0.5, 1.0, 1.5, 2.0]
-const BUNDLE_PRESETS = [0.01, 0.1, 0.25, 0.5, 1.0]
-const HOLDER_PRESETS = [0.1, 0.25, 0.5, 1.0]
+const BUNDLE_COUNTS = [0, 1, 2, 3, 4, 6, 8, 12, 16]
+const fmtNum = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n))
+const resize = (arr: number[], n: number, fill: number) => Array.from({ length: n }, (_, i) => arr[i] ?? fill)
+const resizeIds = (arr: (string | null)[], n: number) => Array.from({ length: n }, (_, i) => arr[i] ?? null)
 
 export default function Launch() {
-  const navigate = useNavigate()
-  const [form, setForm] = useState<LaunchForm>({
-    tokenName: '',
-    tokenSymbol: '',
-    description: '',
-    imageUrl: '',
-    website: '',
-    twitter: '',
-    telegram: '',
-    devBuyAmount: 2,
-    bundleWalletCount: 2,
-    bundleSwapAmounts: [0.01, 0.01],
-    holderWalletCount: 0,
-    holderSwapAmounts: [],
-    holderAutoBuy: false,
-    holderAutoBuyDelay: 0,
-    useJito: true,
-    useLUT: false,
-    strictBundle: true,
-    autoSellAfterLaunch: true,
-    mintAddressMode: (localStorage.getItem('mintAddressMode') as 'random' | 'vanity') || 'random',
-    vanityMintPublicKey: '',
-    devWalletId: '',
-    bundleWalletIds: [null, null, null, null],
-    holderWalletIds: [],
+  const [form, setForm] = useState<Form>({
+    tokenName: '', tokenSymbol: '', description: '', imageUrl: '', twitter: '', telegram: '', website: '',
+    devBuyAmount: 0.5,
+    bundleWalletCount: 2, bundleSwapAmounts: [0.1, 0.1], bundleWalletIds: [null, null],
+    holderWalletCount: 0, holderSwapAmounts: [], holderWalletIds: [],
+    holderAutoBuy: false, holderAutoBuyDelay: 5,
+    useJito: true, strictBundle: true, autoSellAfterLaunch: false,
+    mintAddressMode: 'random',
   })
+  const set = (patch: Partial<Form>) => setForm(f => ({ ...f, ...patch }))
 
-  const [launching, setLaunching] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [imagePreview, setImagePreview] = useState<string | null>(null)
+  const [plan, setPlan] = useState<Plan | null>(null)
+  const [funding, setFunding] = useState<{ configured: boolean; balance?: number | null } | null>(null)
+  const [available, setAvailable] = useState<Wallet[]>([])
+  const [vanity, setVanity] = useState<VanityPool>({ available: 0, total: 0, generating: false })
   const [uploading, setUploading] = useState(false)
   const [dragOver, setDragOver] = useState(false)
-  const [fundingBalance, setFundingBalance] = useState<number | null>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
 
-  const [vanityPool, setVanityPool] = useState<VanityPoolStatus>({ available: 0, used: 0, total: 0, generating: false })
-  const [vanityAddresses, setVanityAddresses] = useState<VanityAddress[]>([])
-  const [aiPrompt, setAiPrompt] = useState('')
-  const [aiGenerating, setAiGenerating] = useState(false)
-  const [aiGenerateDummyLinks, setAiGenerateDummyLinks] = useState(false)
-  const [addTrenchyTagline, setAddTrenchyTagline] = useState(true)
-  const [aiRefFile, setAiRefFile] = useState<File | null>(null)
-  const [aiRefPreview, setAiRefPreview] = useState<string | null>(null)
-  const aiRefInputRef = useRef<HTMLInputElement>(null)
-  const [availableWallets, setAvailableWallets] = useState<AvailableWallet[]>([])
-  const [copiedMint, setCopiedMint] = useState(false)
-  const [randomPreview, setRandomPreview] = useState<string | null>(null)
-  const [profiles, setProfiles] = useState<LaunchProfileSummary[]>([])
-  const [savingProfile, setSavingProfile] = useState(false)
+  const [sim, setSim] = useState<SimResult | null>(null)
+  const [simulating, setSimulating] = useState(false)
+  const [launching, setLaunching] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [launchId, setLaunchId] = useState<string | null>(null)
+  const [stages, setStages] = useState<Stage[]>([])
+  const [result, setResult] = useState<{ mint: string; signature: string } | null>(null)
+  const [failed, setFailed] = useState<string | null>(null)
+  const esRef = useRef<EventSource | null>(null)
 
-  const fetchProfiles = useCallback(() => {
-    axios.get<LaunchProfileSummary[]>('/api/launch-profiles').then(r => setProfiles(r.data)).catch(() => {})
+  // ── data ──
+  useEffect(() => {
+    const load = () => { axios.get('/api/wallets/funding').then(r => setFunding(r.data)).catch(() => {}) }
+    load(); const t = setInterval(load, 15_000)
+    axios.get<Wallet[]>('/api/wallets/available').then(r => setAvailable(r.data)).catch(() => {})
+    return () => clearInterval(t)
   }, [])
 
   useEffect(() => {
-    fetchProfiles()
-  }, [fetchProfiles])
+    const t = setTimeout(() => {
+      axios.post<Plan>('/api/launch/plan', form).then(r => setPlan(r.data)).catch(() => {})
+    }, 250)
+    return () => clearTimeout(t)
+  }, [form])
 
+  const loadVanity = useCallback(() => { axios.get('/api/vanity/pool-status').then(r => setVanity(r.data)).catch(() => {}) }, [])
   useEffect(() => {
-    const fetchBal = () => { axios.get('/api/wallets/funding').then(r => setFundingBalance(r.data.balance)).catch(() => {}) }
-    fetchBal()
-    const iv = setInterval(fetchBal, 15_000)
-    return () => clearInterval(iv)
-  }, [])
+    loadVanity()
+    const t = setInterval(loadVanity, vanity.generating || vanity.collecting ? 2000 : 15_000)
+    return () => clearInterval(t)
+  }, [loadVanity, vanity.generating, vanity.collecting])
 
-  useEffect(() => {
-    axios.get('/api/wallets/available').then(r => setAvailableWallets(r.data)).catch(() => {})
-    if (form.mintAddressMode === 'random') {
-      axios.get('/api/vanity/preview-random').then(r => setRandomPreview(r.data.publicKey)).catch(() => {})
-    }
-  }, [])
-
-  const fetchVanityPool = useCallback(() => {
-    axios.get('/api/vanity/pool-status').then(r => setVanityPool(r.data)).catch(() => {})
-    axios.get('/api/vanity/pool').then(r => {
-      const addrs = (r.data.addresses || []).filter((a: VanityAddress) => a.status === 'available')
-      setVanityAddresses(addrs)
-      if (addrs.length > 0 && form.mintAddressMode === 'vanity') {
-        updateForm({ vanityMintPublicKey: addrs[0].publicKey })
-      }
-    }).catch(() => {})
-  }, [form.mintAddressMode])
-
-  useEffect(() => {
-    fetchVanityPool()
-    const iv = setInterval(fetchVanityPool, vanityPool.generating ? 2_000 : 10_000)
-    return () => clearInterval(iv)
-  }, [fetchVanityPool, vanityPool.generating])
-
-  const uploadImage = useCallback(async (file: File) => {
-    setUploading(true)
+  // ── image ──
+  const upload = async (file: File) => {
+    setUploading(true); setError(null)
     try {
-      const fd = new FormData()
-      fd.append('image', file)
-      const res = await axios.post('/api/upload/image', fd, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      })
-      const url = res.data.url as string
-      setForm(prev => ({ ...prev, imageUrl: url }))
-      setImagePreview(URL.createObjectURL(file))
-    } catch (err: unknown) {
-      console.error('Upload failed:', err)
-    } finally {
-      setUploading(false)
-    }
-  }, [])
-
-  const handleFileDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault()
-    setDragOver(false)
-    const file = e.dataTransfer.files?.[0]
-    if (file && file.type.startsWith('image/')) uploadImage(file)
-  }, [uploadImage])
-
-  const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (file) uploadImage(file)
-  }, [uploadImage])
-
-  const clearImage = () => {
-    setForm(prev => ({ ...prev, imageUrl: '' }))
-    setImagePreview(null)
-    if (fileInputRef.current) fileInputRef.current.value = ''
+      const fd = new FormData(); fd.append('image', file)
+      const r = await axios.post('/api/upload/image', fd)
+      set({ imageUrl: r.data.url })
+    } catch (err) { setError(errorMessage(err)) } finally { setUploading(false) }
   }
 
-  const generateWithAi = useCallback(async () => {
-    const prompt = aiPrompt.trim()
-    if (!prompt || aiGenerating) return
-    setAiGenerating(true)
-    setError(null)
-    try {
-      const formData = new FormData()
-      formData.append('prompt', prompt)
-      if (aiGenerateDummyLinks) formData.append('generateDummyLinks', 'true')
-      if (aiRefFile) formData.append('image', aiRefFile)
-      const res = await axios.post<{ name: string; symbol: string; description: string; imageUrl: string; website?: string; twitter?: string; telegram?: string }>(
-        '/api/ai/generate-token',
-        formData,
-        { headers: { 'Content-Type': 'multipart/form-data' } },
-      )
-      const { name, symbol, description, imageUrl, website, twitter, telegram } = res.data
-      updateForm({ tokenName: name, tokenSymbol: symbol, description, imageUrl, website: website ?? '', twitter: twitter ?? '', telegram: telegram ?? '' })
-      if (imageUrl) setImagePreview(imageUrl)
-    } catch (err: unknown) {
-      const msg = err && typeof err === 'object' && 'response' in err && typeof (err as any).response?.data?.error === 'string'
-        ? (err as any).response.data.error
-        : err instanceof Error ? err.message : 'AI generation failed'
-      setError(msg)
-    } finally {
-      setAiGenerating(false)
-    }
-  }, [aiPrompt, aiGenerating, aiRefFile, aiGenerateDummyLinks])
-
-  const setAiRef = (file: File | null) => {
-    if (aiRefPreview) URL.revokeObjectURL(aiRefPreview)
-    setAiRefFile(file)
-    setAiRefPreview(file ? URL.createObjectURL(file) : null)
-  }
-
-  const updateForm = (updates: Partial<LaunchForm>) =>
-    setForm(prev => ({ ...prev, ...updates }))
-
-  const setMintMode = (mode: 'random' | 'vanity') => {
-    localStorage.setItem('mintAddressMode', mode)
-    updateForm({ mintAddressMode: mode, vanityMintPublicKey: mode === 'vanity' ? (vanityAddresses[0]?.publicKey || '') : '' })
-    if (mode === 'random') {
-      axios.get('/api/vanity/preview-random').then(r => setRandomPreview(r.data.publicKey)).catch(() => {})
-    }
-  }
-
-  const copyMintAddress = (addr: string) => {
-    navigator.clipboard.writeText(addr)
-    setCopiedMint(true)
-    setTimeout(() => setCopiedMint(false), 1500)
-  }
-
-  const refreshRandomPreview = () => {
-    axios.get('/api/vanity/preview-random').then(r => setRandomPreview(r.data.publicKey)).catch(() => {})
-  }
-
-  const startVanity = () => {
-    axios.post('/api/vanity/start', { suffix: 'pump' }).then(() => fetchVanityPool()).catch(() => {})
-  }
-
-  const stopVanity = () => {
-    axios.post('/api/vanity/stop').then(() => fetchVanityPool()).catch(() => {})
-  }
-
-  const fillTestLaunch = () => {
-    updateForm({
-      tokenName: 'Trencher Bundler',
-      tokenSymbol: 'TRENCHER',
-      description: 'Trencher Bundler — Solana token launcher with Jito bundler. Website: trenchytools.lol | GitHub: github.com/TrenchyDev/trenchy-pumpfun-launcher-bundler-dashboard-react | X: @dogtoshi_x',
-      website: 'https://trenchytools.lol/',
-      twitter: 'https://x.com/dogtoshi_x',
-      telegram: 'https://github.com/TrenchyDev/trenchy-pumpfun-launcher-bundler-dashboard-react',
-      devBuyAmount: 2,
-      bundleWalletCount: 2,
-      bundleSwapAmounts: [0.01, 0.01],
-      holderWalletCount: 0,
-      holderSwapAmounts: [],
-      autoSellAfterLaunch: true,
-    })
-  }
-
-  const loadProfile = async (profileId: string) => {
-    if (!profileId) return
-    try {
-      const res = await axios.get<{ form: LaunchForm }>(`/api/launch-profiles/${profileId}`)
-      const f = res.data.form
-      const bc = Math.max(0, Math.min(4, f.bundleWalletCount ?? 0))
-      const hc = Math.max(0, f.holderWalletCount ?? 0)
-      const bundleIds = [...(f.bundleWalletIds || [])]
-      while (bundleIds.length < 4) bundleIds.push(null)
-      const holderIds = [...(f.holderWalletIds || [])]
-      while (holderIds.length < hc) holderIds.push(null)
-      const bundleAmounts = [...(f.bundleSwapAmounts || [])]
-      while (bundleAmounts.length < bc) bundleAmounts.push(0.5)
-      const holderAmounts = [...(f.holderSwapAmounts || [])]
-      while (holderAmounts.length < hc) holderAmounts.push(0.5)
-      setForm({
-        ...f,
-        bundleWalletCount: bc,
-        holderWalletCount: hc,
-        bundleWalletIds: bundleIds.slice(0, 4),
-        holderWalletIds: holderIds.slice(0, hc),
-        bundleSwapAmounts: bundleAmounts.slice(0, bc),
-        holderSwapAmounts: holderAmounts.slice(0, hc),
-      })
-      setImagePreview(f.imageUrl || null)
-      if (f.mintAddressMode === 'vanity') {
-        fetchVanityPool()
-      } else {
-        axios.get('/api/vanity/preview-random').then(r => setRandomPreview(r.data.publicKey)).catch(() => {})
-      }
-    } catch (err) { console.error(err) }
-  }
-
-  const saveProfile = async () => {
-    const name = window.prompt('Profile name', form.tokenName ? `${form.tokenName} (${form.tokenSymbol})` : 'My Launch Profile')
-    if (!name?.trim()) return
-    setSavingProfile(true)
-    try {
-      await axios.post('/api/launch-profiles', { name: name.trim(), form })
-      fetchProfiles()
-    } catch (err) { console.error(err) }
-    finally { setSavingProfile(false) }
-  }
-
-  const setBundleCount = (count: number) => {
-    const amounts = Array(count).fill(0.5)
-    for (let i = 0; i < Math.min(count, form.bundleSwapAmounts.length); i++)
-      amounts[i] = form.bundleSwapAmounts[i]
-    const ids: (string | null)[] = Array(count).fill(null)
-    for (let i = 0; i < Math.min(count, form.bundleWalletIds.length); i++)
-      ids[i] = form.bundleWalletIds[i]
-    const extra: Partial<LaunchForm> = { bundleWalletCount: count, bundleSwapAmounts: amounts, bundleWalletIds: ids }
-    if (count > 3) extra.useLUT = true
-    updateForm(extra)
-  }
-
-  const setBundleAmount = (idx: number, val: number) => {
-    const amounts = [...form.bundleSwapAmounts]
-    amounts[idx] = val
-    updateForm({ bundleSwapAmounts: amounts })
-  }
-
-  const setHolderCount = (count: number) => {
-    const amounts = Array(count).fill(0.5)
-    for (let i = 0; i < Math.min(count, form.holderSwapAmounts.length); i++)
-      amounts[i] = form.holderSwapAmounts[i]
-    const ids: (string | null)[] = Array(count).fill(null)
-    for (let i = 0; i < Math.min(count, form.holderWalletIds.length); i++)
-      ids[i] = form.holderWalletIds[i]
-    updateForm({ holderWalletCount: count, holderSwapAmounts: amounts, holderWalletIds: ids })
-  }
-
-  const setHolderAmount = (idx: number, val: number) => {
-    const amounts = [...form.holderSwapAmounts]
-    amounts[idx] = val
-    updateForm({ holderSwapAmounts: amounts })
-  }
-
-  const setBundleWalletId = (idx: number, id: string | null) => {
-    const ids = [...form.bundleWalletIds]
-    ids[idx] = id
-    updateForm({ bundleWalletIds: ids })
-  }
-
-  const setHolderWalletId = (idx: number, id: string | null) => {
-    const ids = [...form.holderWalletIds]
-    ids[idx] = id
-    updateForm({ holderWalletIds: ids })
-  }
-
-  const selectedIds = new Set([
-    form.devWalletId,
-    ...form.bundleWalletIds.filter(Boolean),
-    ...form.holderWalletIds.filter(Boolean),
-  ].filter(Boolean))
-
-  const walletOptions = (currentId: string | null) =>
-    availableWallets.filter(w => w.id === currentId || !selectedIds.has(w.id))
-
-  const WalletSelect = ({ value, onChange, slot }: { value: string | null; onChange: (id: string | null) => void; slot: string }) => {
-    const opts = walletOptions(value)
-    if (availableWallets.length === 0) return null
+  // ── wallet pickers ──
+  const picked = new Set([...form.bundleWalletIds, ...form.holderWalletIds].filter(Boolean))
+  const WalletPick = ({ value, onChange }: { value: string | null; onChange: (id: string | null) => void }) => {
+    if (!available.length) return null
     return (
-      <select
-        className="input font-mono"
-        style={{ padding: '3px 6px', fontSize: 10, maxWidth: 140, color: value ? '#a78bfa' : '#64748b' }}
-        value={value || ''}
-        onChange={e => onChange(e.target.value || null)}
-        title={`Select wallet for ${slot}`}
-      >
-        <option value="">Auto</option>
-        {opts.map(w => (
-          <option key={w.id} value={w.id}>
-            {w.label.length > 12 ? w.label.slice(0, 12) + '…' : w.label} ({w.publicKey.slice(0, 4)}…{w.publicKey.slice(-4)})
-          </option>
-        ))}
+      <select className="input font-mono" style={{ padding: '3px 24px 3px 6px', fontSize: 10, maxWidth: 150, color: value ? '#a78bfa' : '#64748b' }} value={value || ''} onChange={e => onChange(e.target.value || null)}>
+        <option value="">new wallet</option>
+        {available.filter(w => w.id === value || !picked.has(w.id)).map(w => <option key={w.id} value={w.id}>{w.label.slice(0, 12)} ({short(w.publicKey)})</option>)}
       </select>
     )
   }
 
-  const tipSol = form.useJito ? 0.005 : 0
-  const devOverhead = tipSol + 0.1
-  const totalSol =
-    form.devBuyAmount + devOverhead +
-    form.bundleSwapAmounts.reduce((a, b) => a + b, 0) + form.bundleWalletCount * 0.02 +
-    form.holderSwapAmounts.reduce((a, b) => a + b, 0) + form.holderWalletCount * 0.01
-  const insufficientFunds = fundingBalance !== null && fundingBalance < totalSol
+  // ── simulate / launch ──
+  const payload = () => ({ ...form, bundleWalletIds: form.bundleWalletIds.some(Boolean) ? form.bundleWalletIds : undefined, holderWalletIds: form.holderWalletIds.some(Boolean) ? form.holderWalletIds : undefined })
+  const ready = !!form.tokenName && !!form.tokenSymbol && !!form.imageUrl
+  const insufficient = plan != null && funding?.balance != null && funding.balance < plan.total
 
-  const handleLaunch = async () => {
-    if (!form.tokenName || !form.tokenSymbol) return
-    setLaunching(true)
-    setError(null)
-
-    try {
-      const description = addTrenchyTagline && form.description
-        ? `${form.description.trim()}\n\n\nLaunched with https://trenchytools.lol/`
-        : form.description
-      const payload = {
-        ...form,
-        description,
-        devWalletId: form.devWalletId || undefined,
-        bundleWalletIds: form.bundleWalletIds.some(Boolean) ? form.bundleWalletIds : undefined,
-        holderWalletIds: form.holderWalletIds.some(Boolean) ? form.holderWalletIds : undefined,
-      }
-      const res = await axios.post('/api/launch', payload)
-      const { launchId } = res.data
-      navigate('/trading', { state: { launchId, holderAutoBuy: form.holderAutoBuy, autoSellAfterLaunch: form.autoSellAfterLaunch } })
-    } catch (err: unknown) {
-      const msg = err && typeof err === 'object' && 'response' in err
-        ? (err as { response?: { data?: { error?: string }; status?: number }; message?: string }).response?.data?.error
-          || (err as { message?: string }).message
-        : String(err)
-      setError(msg || 'Launch failed')
-      setLaunching(false)
-    }
+  const simulate = async () => {
+    setSimulating(true); setSim(null); setError(null)
+    try { setSim((await axios.post<SimResult>('/api/launch/simulate', payload())).data) }
+    catch (err) { setError(errorMessage(err)) } finally { setSimulating(false) }
   }
+
+  const launch = async () => {
+    if (!ready) return
+    if (!confirm(`Launch ${form.tokenName} ($${form.tokenSymbol})? About ${plan?.total.toFixed(3)} SOL leaves the funding wallet.`)) return
+    setLaunching(true); setError(null); setSim(null); setStages([]); setResult(null); setFailed(null)
+    try {
+      const r = await axios.post('/api/launch', payload())
+      setLaunchId(r.data.launchId)
+    } catch (err) { setError(errorMessage(err)); setLaunching(false) }
+  }
+
+  useEffect(() => {
+    if (!launchId) return
+    esRef.current?.close()
+    const es = new EventSource(`/api/launch/${launchId}/stream`)
+    esRef.current = es
+    es.onmessage = ev => {
+      const d = JSON.parse(ev.data) as { stage: string; message: string; mint?: string; signature?: string }
+      if (d.stage === 'replay-start') { setStages([]); return }
+      setStages(prev => [...prev, { stage: d.stage, message: d.message, at: Date.now() }])
+      if (d.stage === 'done') { setResult({ mint: d.mint || '', signature: d.signature || '' }); setLaunching(false); window.dispatchEvent(new Event('funding-changed')) }
+      if (d.stage === 'error') { setFailed(d.message); setLaunching(false); es.close() }
+      if (d.stage === 'auto-sell-done' || d.stage === 'holder-done') es.close()
+    }
+    es.onerror = () => { /* EventSource reconnects and the server replays */ }
+    return () => es.close()
+  }, [launchId])
+
+  // ── pieces ──
+  const num = (v: number, onChange: (n: number) => void, w = 80) => (
+    <input type="number" className="input font-mono" style={{ width: w, padding: '5px 8px', fontSize: 12 }} value={v} step={0.01} min={0} onChange={e => onChange(Number(e.target.value))} />
+  )
+  const toggle = (on: boolean, onClick: () => void, label: React.ReactNode, sub?: string, color?: string) => (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }} onClick={onClick}>
+      <div className={`toggle-track${on ? ' on' : ''}`} style={on && color ? { background: color } : undefined}><div className="toggle-knob" /></div>
+      <div><div style={{ fontSize: 13, color: '#e2e8f0', display: 'flex', alignItems: 'center' }}>{label}</div>{sub && <div style={{ fontSize: 11, color: '#64748b' }}>{sub}</div>}</div>
+    </div>
+  )
+  const stageColor = (s: string) => (s === 'done' ? '#34d399' : s === 'error' ? '#fb7185' : s === 'warning' ? '#fbbf24' : '#94a3b8')
 
   return (
     <div className="fade-up">
-      <div style={{ marginBottom: 24, display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
-        <div>
-          <h1 className="page-title">Launch Token</h1>
-          <p className="page-subtitle">Create and deploy a new token on Pump.fun with bundled buys</p>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-            <span style={{ fontSize: 9, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: 0.5 }}>Profiles</span>
-            <select
-              className="input"
-              style={{ padding: '4px 8px', fontSize: 10, minWidth: 140, background: 'rgba(15,23,42,0.6)', border: '1px solid rgba(37,51,70,0.5)' }}
-              value=""
-              onChange={e => { const v = e.target.value; if (v) loadProfile(v); e.target.value = '' }}
-              title="Load a saved profile"
-            >
-              <option value="">Load profile...</option>
-              {profiles.map(p => (
-                <option key={p.id} value={p.id}>
-                  {p.name} {p.tokenSymbol ? `(${p.tokenSymbol})` : ''}
-                </option>
-              ))}
-            </select>
-          </div>
-          <button
-            className="btn-ghost"
-            style={{ fontSize: 11, border: '1px solid rgba(96,165,250,0.4)', borderRadius: 6, padding: '6px 12px', color: '#60a5fa' }}
-            onClick={saveProfile}
-            disabled={savingProfile}
-            title="Save current form as a reusable profile"
-          >
-            {savingProfile ? 'Saving...' : 'Save as profile'}
-          </button>
-          <button className="btn-ghost" style={{ fontSize: 11, border: '1px solid #253346', borderRadius: 6, padding: '6px 12px' }}
-            onClick={fillTestLaunch}>
-            Fill Test Launch
-          </button>
-        </div>
-      </div>
-
-      {/* Vanity Mint — sleek top bar */}
-      <div style={{
-        display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16,
-        padding: '8px 14px', borderRadius: 8,
-        background: 'rgba(15,23,42,0.5)', border: '1px solid rgba(37,51,70,0.5)',
-      }}>
-        <span style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.5, color: '#64748b' }}>Mint</span>
-        <div style={{ display: 'flex', gap: 4 }}>
-          <button className={`chip${form.mintAddressMode === 'random' ? ' active' : ''}`}
-            style={{ padding: '3px 10px', fontSize: 10 }} onClick={() => setMintMode('random')}>Random</button>
-          <button className={`chip${form.mintAddressMode === 'vanity' ? ' active' : ''}`}
-            style={{ padding: '3px 10px', fontSize: 10 }} onClick={() => setMintMode('vanity')}>Vanity</button>
-        </div>
-        {form.mintAddressMode === 'vanity' ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 }}>
-            {vanityAddresses.length > 0 ? (
-              <>
-                <span style={{ fontSize: 9, color: '#475569' }}>Next:</span>
-                <span className="font-mono" style={{ fontSize: 11, color: '#14b8a6', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'pointer' }}
-                  onClick={() => copyMintAddress(vanityAddresses[0].publicKey)}
-                  title={vanityAddresses[0].publicKey}>
-                  {vanityAddresses[0].publicKey.slice(0, 8)}...{vanityAddresses[0].publicKey.slice(-6)}
-                </span>
-                <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 4px', borderRadius: 3, background: 'rgba(20,184,166,0.12)', color: '#14b8a6' }}>pump</span>
-                <button className="btn-ghost" style={{ fontSize: 9, padding: '2px 6px', color: copiedMint ? '#34d399' : '#475569', flexShrink: 0 }}
-                  onClick={() => copyMintAddress(vanityAddresses[0].publicKey)}>
-                  {copiedMint ? '✓' : 'Copy'}
-                </button>
-              </>
-            ) : (
-              <span style={{ fontSize: 10, color: '#fb7185' }}>No vanity addresses</span>
-            )}
-            {vanityPool.generating && vanityPool.stats ? (
-              <span className="font-mono" style={{ fontSize: 9, color: '#fbbf24', flexShrink: 0, animation: 'pulse 2s ease-in-out infinite', marginLeft: 'auto' }}>
-                {fmtNum(vanityPool.stats.checked)} checked · {fmtNum(vanityPool.stats.rate)}/s · {vanityPool.stats.found} found
-              </span>
-            ) : (
-              <span style={{ fontSize: 10, color: '#475569', marginLeft: 'auto', flexShrink: 0 }}>
-                <span style={{ color: vanityPool.available > 0 ? '#34d399' : '#fb7185', fontWeight: 600 }}>{vanityPool.available}</span> left
-              </span>
-            )}
-            {vanityPool.generating ? (
-              <button className="btn-ghost" style={{ fontSize: 9, color: '#fb7185', padding: '2px 6px', flexShrink: 0 }} onClick={stopVanity}>Stop</button>
-            ) : (
-              <button className="btn-ghost" style={{ fontSize: 9, color: '#14b8a6', padding: '2px 6px', flexShrink: 0 }} onClick={startVanity}>+ Gen</button>
-            )}
-          </div>
-        ) : (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 }}>
-            {randomPreview ? (
-              <>
-                <span style={{ fontSize: 9, color: '#475569' }}>Next:</span>
-                <span className="font-mono" style={{ fontSize: 11, color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'pointer' }}
-                  onClick={() => copyMintAddress(randomPreview)}
-                  title={randomPreview}>
-                  {randomPreview.slice(0, 8)}...{randomPreview.slice(-4)}
-                </span>
-                <button className="btn-ghost" style={{ fontSize: 9, padding: '2px 6px', color: copiedMint ? '#34d399' : '#475569', flexShrink: 0 }}
-                  onClick={() => copyMintAddress(randomPreview)}>
-                  {copiedMint ? '✓' : 'Copy'}
-                </button>
-                <button className="btn-ghost" style={{ fontSize: 9, padding: '2px 6px', color: '#475569', flexShrink: 0 }}
-                  onClick={refreshRandomPreview}>↻</button>
-              </>
-            ) : (
-              <span style={{ fontSize: 10, color: '#475569' }}>Generating preview...</span>
-            )}
-          </div>
-        )}
+      <div style={{ marginBottom: 16 }}>
+        <h1 className="page-title">Launch</h1>
+        <p className="page-subtitle">Create a pump.fun coin with a dev buy and bundled buyers in one Jito bundle. Everything runs through the TrenchyTools API; your keys stay here.</p>
       </div>
 
       <div className="grid-form">
-        {/* ── Left column: Form ── */}
+        {/* ── the form ── */}
         <div className="space-y">
-          {/* Token Details — compact: image top, links under description */}
           <div className="card">
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-              <h3 className="section-title" style={{ margin: 0 }}>Token Details</h3>
-              {/* AI Generate — inline toggle */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                <input
-                  ref={aiRefInputRef}
-                  type="file"
-                  accept="image/*"
-                  style={{ display: 'none' }}
-                  onChange={e => setAiRef(e.target.files?.[0] ?? null)}
-                />
-                {aiRefPreview ? (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
-                    <img src={aiRefPreview} alt="Ref" style={{ width: 20, height: 20, borderRadius: 4, objectFit: 'cover', border: '1px solid #253346' }} />
-                    <button type="button" className="btn-ghost" style={{ padding: 1, fontSize: 9, color: '#94a3b8' }} onClick={() => setAiRef(null)}>×</button>
-                  </div>
-                ) : (
-                  <button type="button" className="btn-ghost" style={{ padding: '2px 6px', fontSize: 9, color: '#475569' }} onClick={() => aiRefInputRef.current?.click()}>ref</button>
-                )}
-                <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9, color: '#64748b', cursor: 'pointer' }}>
-                  <input type="checkbox" checked={aiGenerateDummyLinks} onChange={e => setAiGenerateDummyLinks(e.target.checked)} style={{ width: 12, height: 12 }} />
-                  dummy links
-                </label>
-                <input
-                  className="input"
-                  style={{ width: 150, padding: '3px 6px', fontSize: 10 }}
-                  placeholder="AI prompt..."
-                  value={aiPrompt}
-                  onChange={e => setAiPrompt(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && generateWithAi()}
-                  disabled={aiGenerating}
-                />
-                <button
-                  className="btn-ghost"
-                  style={{ padding: '3px 6px', fontSize: 10, color: aiGenerating ? '#a78bfa' : '#64748b', display: 'flex', alignItems: 'center', gap: 3 }}
-                  onClick={generateWithAi}
-                  disabled={!aiPrompt.trim() || aiGenerating}
-                >
-                  <SparklesIcon style={{ width: 11, height: 11 }} />
-                  {aiGenerating ? '...' : 'AI'}
-                </button>
+            <h3 className="section-title">Token</h3>
+            <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start' }}>
+              <div
+                onDragOver={e => { e.preventDefault(); setDragOver(true) }} onDragLeave={() => setDragOver(false)}
+                onDrop={e => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files?.[0]; if (f) upload(f) }}
+                onClick={() => fileRef.current?.click()}
+                style={{ width: 96, height: 96, flexShrink: 0, borderRadius: 12, border: `2px dashed ${dragOver ? '#14b8a6' : '#253346'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', overflow: 'hidden', background: dragOver ? 'rgba(20,184,166,0.05)' : 'transparent' }}
+                title="Click or drop an image (png, jpg, gif, webp, 5 MB)"
+              >
+                {form.imageUrl ? <img src={form.imageUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  : uploading ? <span style={{ fontSize: 11, color: '#14b8a6' }}>uploading…</span>
+                  : <div style={{ textAlign: 'center', color: '#475569', fontSize: 10 }}><PhotoIcon style={{ width: 22, height: 22, display: 'inline-block' }} /><div>image</div></div>}
+                <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={e => { const f = e.target.files?.[0]; if (f) upload(f) }} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <div className="grid-2" style={{ gap: 10 }}>
+                  <div><label className="label">Name</label><input className="input" style={{ padding: '7px 10px', fontSize: 13 }} placeholder="My Coin" value={form.tokenName} onChange={e => set({ tokenName: e.target.value })} /></div>
+                  <div><label className="label">Symbol</label><input className="input" style={{ padding: '7px 10px', fontSize: 13 }} placeholder="COIN" value={form.tokenSymbol} onChange={e => set({ tokenSymbol: e.target.value.toUpperCase() })} /></div>
+                </div>
+                <div style={{ marginTop: 10 }}>
+                  <label className="label">Description</label>
+                  <textarea className="input" style={{ padding: '7px 10px', fontSize: 12, minHeight: 56 }} placeholder="What is it?" value={form.description} onChange={e => set({ description: e.target.value })} />
+                </div>
               </div>
             </div>
-            {/* Image at top */}
-            <div style={{ marginBottom: 14 }}>
-              {imagePreview || form.imageUrl ? (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <img src={imagePreview || form.imageUrl} alt="Token"
-                    style={{ width: 56, height: 56, borderRadius: 10, objectFit: 'cover', border: '1px solid #253346' }} />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: 'flex', gap: 6 }}>
-                      <button className="btn-ghost" style={{ fontSize: 11 }} onClick={() => fileInputRef.current?.click()}>Replace</button>
-                      <button className="btn-ghost" style={{ fontSize: 11, color: '#fb7185' }} onClick={clearImage}>Remove</button>
-                    </div>
-                    <input className="input font-mono" style={{ fontSize: 10, marginTop: 6, padding: '4px 8px' }} placeholder="or paste URL"
-                      value={form.imageUrl.startsWith('/api/') ? '' : form.imageUrl}
-                      onChange={e => { updateForm({ imageUrl: e.target.value }); setImagePreview(null) }} />
-                  </div>
-                </div>
-              ) : (
-                <div
-                  onDragOver={e => { e.preventDefault(); setDragOver(true) }}
-                  onDragLeave={() => setDragOver(false)}
-                  onDrop={handleFileDrop}
-                  onClick={() => fileInputRef.current?.click()}
-                  style={{
-                    border: `2px dashed ${dragOver ? '#14b8a6' : '#253346'}`,
-                    borderRadius: 10,
-                    padding: '14px 12px',
-                    textAlign: 'center',
-                    cursor: 'pointer',
-                    transition: 'border-color 0.15s, background 0.15s',
-                    background: dragOver ? 'rgba(20,184,166,0.04)' : 'transparent',
-                  }}
-                >
-                  {uploading ? (
-                    <span style={{ fontSize: 12, color: '#14b8a6' }}>Uploading...</span>
-                  ) : (
-                    <>
-                      <PhotoIcon style={{ width: 24, height: 24, color: '#475569', marginBottom: 4, display: 'inline-block' }} />
-                      <div style={{ fontSize: 11, color: '#94a3b8' }}>Drop image or click · PNG/JPG max 5MB</div>
-                    </>
+            <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <input className="input" style={{ flex: 1, minWidth: 140, fontSize: 11, padding: '6px 10px' }} placeholder="Twitter / X URL" value={form.twitter} onChange={e => set({ twitter: e.target.value })} />
+              <input className="input" style={{ flex: 1, minWidth: 140, fontSize: 11, padding: '6px 10px' }} placeholder="Telegram URL" value={form.telegram} onChange={e => set({ telegram: e.target.value })} />
+              <input className="input" style={{ flex: 1, minWidth: 140, fontSize: 11, padding: '6px 10px' }} placeholder="Website URL" value={form.website} onChange={e => set({ website: e.target.value })} />
+            </div>
+            {form.imageUrl && <div style={{ marginTop: 8 }}><button className="btn-ghost" style={{ fontSize: 11, color: '#fb7185' }} onClick={() => set({ imageUrl: '' })}>Remove image</button></div>}
+          </div>
+
+          <div className="card">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <h3 className="section-title" style={{ margin: 0, display: 'flex', alignItems: 'center' }}>Mint address<Tip text="A vanity mint ends in …pump. The TrenchyTools API grinds it (POST /api/sol/vanity); every key it hands back is saved to backend/data/vanity-pool.json before a launch uses it." /></h3>
+              <div style={{ display: 'flex', gap: 4 }}>
+                <button className={`chip${form.mintAddressMode === 'random' ? ' active' : ''}`} onClick={() => set({ mintAddressMode: 'random' })}>Random</button>
+                <button className={`chip${form.mintAddressMode === 'vanity' ? ' active' : ''}`} onClick={() => set({ mintAddressMode: 'vanity' })}>Vanity …pump</button>
+              </div>
+              {form.mintAddressMode === 'vanity' && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, flex: 1, flexWrap: 'wrap' }}>
+                  <span style={{ color: vanity.available > 0 ? '#34d399' : '#fb7185', fontWeight: 600 }}>{vanity.available} ready</span>
+                  {(vanity.generating || vanity.collecting) && vanity.stats && (
+                    <span className="font-mono" style={{ color: '#fbbf24', animation: 'pulse 2s ease-in-out infinite' }}>
+                      API {vanity.collecting ? 'finishing' : 'grinding'} …{vanity.stats.suffix}: {fmtNum(vanity.stats.attempts)} / ~{fmtNum(vanity.stats.expectedAttempts)} ({Math.round(vanity.stats.progress * 100)} %) · {vanity.stats.found} found
+                    </span>
                   )}
+                  {!vanity.generating && vanity.stats?.lastError && <span style={{ color: '#fb7185' }} title={vanity.stats.lastError}>{vanity.stats.lastError.slice(0, 80)}</span>}
+                  <div style={{ flex: 1 }} />
+                  {vanity.generating
+                    ? <button className="btn-ghost" style={{ fontSize: 11, color: '#fb7185' }} onClick={() => axios.post('/api/vanity/stop').then(loadVanity)}>Stop</button>
+                    : <button className="btn-ghost" style={{ fontSize: 11, color: '#14b8a6' }} onClick={() => axios.post('/api/vanity/start', { suffix: 'pump' }).then(loadVanity).catch(err => setError(errorMessage(err)))}>Generate more</button>}
                 </div>
               )}
-              <input ref={fileInputRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={handleFileSelect} />
-            </div>
-
-            <div className="grid-2" style={{ gap: 12 }}>
-              <div>
-                <label className="label">Token Name</label>
-                <input className="input" style={{ padding: '8px 10px', fontSize: 13 }} placeholder="My Token" value={form.tokenName}
-                  onChange={e => updateForm({ tokenName: e.target.value })} />
-              </div>
-              <div>
-                <label className="label">Symbol</label>
-                <input className="input" style={{ padding: '8px 10px', fontSize: 13 }} placeholder="MTK" value={form.tokenSymbol}
-                  onChange={e => updateForm({ tokenSymbol: e.target.value })} />
-              </div>
-            </div>
-            <div style={{ marginTop: 12 }}>
-              <label className="label">Description</label>
-              <textarea className="input" style={{ padding: '8px 10px', fontSize: 12, minHeight: 56 }} placeholder="Token description..."
-                value={form.description} onChange={e => updateForm({ description: e.target.value })} />
-              <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 11, color: '#64748b', cursor: 'pointer' }}>
-                <input type="checkbox" checked={addTrenchyTagline} onChange={e => setAddTrenchyTagline(e.target.checked)} style={{ width: 14, height: 14 }} />
-                Add &quot;Launched with https://trenchytools.lol/&quot; at end of description
-              </label>
-            </div>
-            {/* Links — enter any URL; we route to the correct pump.fun field by domain */}
-            <div style={{ marginTop: 12, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-              <input className="input" style={{ flex: 1, minWidth: 120, fontSize: 11, padding: '6px 10px' }} placeholder="Link 1 (any URL)"
-                value={form.website} onChange={e => updateForm({ website: e.target.value })} />
-              <input className="input" style={{ flex: 1, minWidth: 120, fontSize: 11, padding: '6px 10px' }} placeholder="Link 2 (any URL)"
-                value={form.twitter} onChange={e => updateForm({ twitter: e.target.value })} />
-              <input className="input" style={{ flex: 1, minWidth: 120, fontSize: 11, padding: '6px 10px' }} placeholder="Link 3 (any URL)"
-                value={form.telegram} onChange={e => updateForm({ telegram: e.target.value })} />
             </div>
           </div>
 
-          {/* Wallet Configuration — Bundle + Holder in one card with sub-boxes */}
           <div className="card">
-            <h3 className="section-title">Wallet Configuration</h3>
-
-            {/* Dev Buy — compact */}
-            <div style={{ marginBottom: 14 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-                <label className="label" style={{ display: 'flex', alignItems: 'center', margin: 0 }}>Dev Buy<Tip text="The SOL amount the dev wallet will use to buy tokens. The full amount goes to buying — overhead (gas, rent) is added automatically on top." /></label>
-                <WalletSelect value={form.devWalletId || null} onChange={id => updateForm({ devWalletId: id || '' })} slot="Dev" />
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <input type="number" className="input font-mono" style={{ width: 80, padding: '6px 10px', fontSize: 12 }}
-                  value={form.devBuyAmount} step={0.01} min={0}
-                  onChange={e => updateForm({ devBuyAmount: Number(e.target.value) })} />
-                <span style={{ fontSize: 11, color: '#64748b' }}>SOL</span>
-                <div style={{ display: 'flex', gap: 3 }}>
-                  {DEV_PRESETS.map(p => (
-                    <button key={p} className={`chip${form.devBuyAmount === p ? ' active' : ''}`} style={{ padding: '4px 8px', fontSize: 11 }}
-                      onClick={() => updateForm({ devBuyAmount: p })}>{p}</button>
-                  ))}
-                </div>
-              </div>
+            <h3 className="section-title">Buys</h3>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+              <label className="label" style={{ margin: 0, display: 'flex', alignItems: 'center' }}>Dev buy<Tip text="The dev wallet creates the coin and buys this much SOL of it in the same transaction. The dev wallet is created for this launch (and backed up) unless you pick one." /></label>
+              {num(form.devBuyAmount, n => set({ devBuyAmount: n }))}
+              <span style={{ fontSize: 11, color: '#64748b' }}>SOL</span>
+              {[0.1, 0.25, 0.5, 1, 2].map(p => <button key={p} className={`chip${form.devBuyAmount === p ? ' active' : ''}`} style={{ padding: '3px 8px' }} onClick={() => set({ devBuyAmount: p })}>{p}</button>)}
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
-              {/* Bundle Wallets — outlined sub-box */}
-              <div style={{
-                padding: 12,
-                borderRadius: 8,
-                border: '1px solid rgba(37,51,70,0.6)',
-                background: 'rgba(15,23,42,0.3)',
-              }}>
-                <div style={{ fontSize: 10, fontWeight: 700, color: '#34d399', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8, display: 'flex', alignItems: 'center' }}>Bundle<Tip text="Wallets that buy atomically in the same Jito bundle as the dev buy. They appear as separate buyers on-chain but execute in one block. MEV-protected." /></div>
-                <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
-                  {[0, 1, 2, 3, 4, 5].map(n => (
-                    <button key={n} className={`chip${form.bundleWalletCount === n ? ' active' : ''}`}
-                      style={{ width: 28, padding: '4px 0', fontSize: 10 }} onClick={() => setBundleCount(n)}>{n}</button>
-                  ))}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 12 }}>
+              <div style={{ padding: 12, borderRadius: 8, border: '1px solid rgba(37,51,70,0.6)', background: 'rgba(15,23,42,0.3)' }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: '#34d399', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8, display: 'flex', alignItems: 'center' }}>Bundle buyers<Tip text="Buy in the same Jito bundle as the create, all in one block. Up to 4 go one per transaction; 5 to 16 use a lookup table (created automatically, ~0.01 SOL rent refunded after the launch). Each wallet is created and backed up before it is funded." /></div>
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
+                  {BUNDLE_COUNTS.map(n => <button key={n} className={`chip${form.bundleWalletCount === n ? ' active' : ''}`} style={{ width: 30, padding: '3px 0' }} onClick={() => set({ bundleWalletCount: n, bundleSwapAmounts: resize(form.bundleSwapAmounts, n, 0.1), bundleWalletIds: resizeIds(form.bundleWalletIds, n) })}>{n}</button>)}
                 </div>
-                {form.bundleWalletCount > 0 && (
-                  <>
-                    <div style={{ display: 'flex', gap: 3, alignItems: 'center', marginBottom: 6 }}>
-                      <span style={{ fontSize: 10, color: '#64748b' }}>Set all:</span>
-                      {BUNDLE_PRESETS.map(p => (
-                        <button key={p} className="chip" style={{ padding: '2px 6px', fontSize: 10 }}
-                          onClick={() => updateForm({ bundleSwapAmounts: form.bundleSwapAmounts.map(() => p) })}>{p}</button>
-                      ))}
-                    </div>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      {form.bundleSwapAmounts.map((amt, i) => (
-                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <span style={{ fontSize: 10, color: '#64748b', width: 24 }}>B{i + 1}</span>
-                          <input type="number" className="input font-mono" style={{ flex: 1, padding: '4px 8px', fontSize: 11 }}
-                            value={amt} step={0.01} min={0} onChange={e => setBundleAmount(i, Number(e.target.value))} />
-                          <span style={{ fontSize: 10, color: '#64748b' }}>SOL</span>
-                          <WalletSelect value={form.bundleWalletIds[i] ?? null} onChange={id => setBundleWalletId(i, id)} slot={`B${i + 1}`} />
-                        </div>
-                      ))}
-                    </div>
-                  </>
-                )}
-              </div>
-
-              {/* Holder Wallets — outlined sub-box */}
-              <div style={{
-                padding: 12,
-                borderRadius: 8,
-                border: '1px solid rgba(37,51,70,0.6)',
-                background: 'rgba(15,23,42,0.3)',
-              }}>
-                <div style={{ fontSize: 10, fontWeight: 700, color: '#fbbf24', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8, display: 'flex', alignItems: 'center' }}>Holder<Tip text="Wallets funded at launch but buy AFTER the bundle lands. Useful for manual market-making. Can auto-buy with a configurable delay." /></div>
-                <div style={{ display: 'flex', gap: 4, marginBottom: 8, flexWrap: 'wrap' }}>
-                  {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(n => (
-                    <button key={n} className={`chip${form.holderWalletCount === n ? ' active' : ''}`}
-                      style={{ width: 26, padding: '4px 0', fontSize: 10 }} onClick={() => setHolderCount(n)}>{n}</button>
-                  ))}
-                </div>
-                {form.holderWalletCount > 0 && (
-                  <>
-                    <div style={{ display: 'flex', gap: 3, alignItems: 'center', marginBottom: 6 }}>
-                      <span style={{ fontSize: 10, color: '#64748b' }}>Set all:</span>
-                      {HOLDER_PRESETS.map(p => (
-                        <button key={p} className="chip" style={{ padding: '2px 6px', fontSize: 10 }}
-                          onClick={() => updateForm({ holderSwapAmounts: form.holderSwapAmounts.map(() => p) })}>{p}</button>
-                      ))}
-                    </div>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 8 }}>
-                      {form.holderSwapAmounts.map((amt, i) => (
-                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <span style={{ fontSize: 10, color: '#64748b', width: 24 }}>H{i + 1}</span>
-                          <input type="number" className="input font-mono" style={{ flex: 1, padding: '4px 8px', fontSize: 11 }}
-                            value={amt} step={0.01} min={0} onChange={e => setHolderAmount(i, Number(e.target.value))} />
-                          <span style={{ fontSize: 10, color: '#64748b' }}>SOL</span>
-                          <WalletSelect value={form.holderWalletIds[i] ?? null} onChange={id => setHolderWalletId(i, id)} slot={`H${i + 1}`} />
-                        </div>
-                      ))}
-                    </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }} onClick={() => updateForm({ holderAutoBuy: !form.holderAutoBuy })}>
-                      <div className={`toggle-track${form.holderAutoBuy ? ' on' : ''}`} style={{ flexShrink: 0 }}>
-                        <div className="toggle-knob" />
+                {form.bundleWalletCount > 0 && (<>
+                  <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginBottom: 6, fontSize: 10, color: '#64748b' }}>all: {[0.05, 0.1, 0.25, 0.5, 1].map(p => <button key={p} className="chip" style={{ padding: '1px 6px' }} onClick={() => set({ bundleSwapAmounts: form.bundleSwapAmounts.map(() => p) })}>{p}</button>)}</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {form.bundleSwapAmounts.map((a, i) => (
+                      <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span style={{ fontSize: 10, color: '#64748b', width: 22 }}>B{i + 1}</span>
+                        {num(a, n => set({ bundleSwapAmounts: form.bundleSwapAmounts.map((x, j) => (j === i ? n : x)) }), 70)}
+                        <span style={{ fontSize: 10, color: '#64748b' }}>SOL</span>
+                        <WalletPick value={form.bundleWalletIds[i] ?? null} onChange={id => set({ bundleWalletIds: form.bundleWalletIds.map((x, j) => (j === i ? id : x)) })} />
                       </div>
-                      <span style={{ fontSize: 11, color: '#94a3b8' }}>Auto-buy after launch</span>
-                      {form.holderAutoBuy && (
-                        <span onClick={e => e.stopPropagation()} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                          <input type="number" className="input font-mono" style={{ width: 50, padding: '2px 6px', fontSize: 10 }}
-                            value={form.holderAutoBuyDelay} step={0.5} min={0}
-                            onChange={e => updateForm({ holderAutoBuyDelay: Number(e.target.value) })} />
-                          <span style={{ fontSize: 9, color: '#64748b' }}>s delay</span>
-                        </span>
-                      )}
-                    </div>
-                  </>
-                )}
+                    ))}
+                  </div>
+                </>)}
+              </div>
+
+              <div style={{ padding: 12, borderRadius: 8, border: '1px solid rgba(37,51,70,0.6)', background: 'rgba(15,23,42,0.3)' }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: '#fbbf24', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8, display: 'flex', alignItems: 'center' }}>Holder wallets (optional)<Tip text="Funded at launch, buy AFTER the bundle lands (auto-buy with a delay, or by hand on the Trading page)." /></div>
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
+                  {[0, 1, 2, 3, 4, 5, 6, 8, 10].map(n => <button key={n} className={`chip${form.holderWalletCount === n ? ' active' : ''}`} style={{ width: 30, padding: '3px 0' }} onClick={() => set({ holderWalletCount: n, holderSwapAmounts: resize(form.holderSwapAmounts, n, 0.1), holderWalletIds: resizeIds(form.holderWalletIds, n) })}>{n}</button>)}
+                </div>
+                {form.holderWalletCount > 0 && (<>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 8 }}>
+                    {form.holderSwapAmounts.map((a, i) => (
+                      <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span style={{ fontSize: 10, color: '#64748b', width: 22 }}>H{i + 1}</span>
+                        {num(a, n => set({ holderSwapAmounts: form.holderSwapAmounts.map((x, j) => (j === i ? n : x)) }), 70)}
+                        <span style={{ fontSize: 10, color: '#64748b' }}>SOL</span>
+                        <WalletPick value={form.holderWalletIds[i] ?? null} onChange={id => set({ holderWalletIds: form.holderWalletIds.map((x, j) => (j === i ? id : x)) })} />
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    {toggle(form.holderAutoBuy, () => set({ holderAutoBuy: !form.holderAutoBuy }), <span style={{ fontSize: 11 }}>Auto-buy after launch</span>)}
+                    {form.holderAutoBuy && <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: '#64748b' }}>{num(form.holderAutoBuyDelay, n => set({ holderAutoBuyDelay: n }), 56)} s delay</span>}
+                  </div>
+                </>)}
               </div>
             </div>
           </div>
 
-          {/* Options */}
-          <div className="card">
-            <h3 className="section-title">Options</h3>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer' }}
-              onClick={() => updateForm({ useJito: !form.useJito })}>
-              <div className={`toggle-track${form.useJito ? ' on' : ''}`}>
-                <div className="toggle-knob" />
-              </div>
-              <div>
-                <div style={{ fontSize: 14, fontWeight: 500, color: '#fff', display: 'flex', alignItems: 'center' }}>Jito Bundle<Tip text="Submits the token creation and all initial buys as a single atomic Jito bundle. All transactions land in the same block — MEV protected, can't be front-run." /></div>
-                <div style={{ fontSize: 12, color: '#64748b' }}>
-                  Submit create + buys as atomic Jito bundle
-                </div>
-              </div>
-            </div>
-
-            {form.useJito && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', marginTop: 16 }}
-                onClick={() => updateForm({ useLUT: !form.useLUT })}>
-                <div className={`toggle-track${form.useLUT ? ' on' : ''}`}>
-                  <div className="toggle-knob" />
-                </div>
-                <div>
-                <div style={{ fontSize: 14, fontWeight: 500, color: '#fff', display: 'flex', alignItems: 'center' }}>Address Lookup Table<Tip text="Creates an on-chain lookup table to compress transaction size. Required for 3+ bundle wallets. Takes ~55s on first launch, then reuses the existing one." /></div>
-                <div style={{ fontSize: 12, color: '#64748b' }}>
-                  Compress transactions via LUT (~55s setup on first launch, reused after)
-                </div>
-                </div>
-              </div>
-            )}
-
-            {form.useJito && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', marginTop: 16 }}
-                onClick={() => updateForm({ strictBundle: !form.strictBundle })}>
-                <div className={`toggle-track${form.strictBundle ? ' on' : ''}`}>
-                  <div className="toggle-knob" />
-                </div>
-                <div>
-                <div style={{ fontSize: 14, fontWeight: 500, color: '#fff', display: 'flex', alignItems: 'center' }}>Strict Bundle Only<Tip text="If ON, the launch will only succeed if the Jito bundle lands. If OFF, falls back to regular RPC transactions (faster but not MEV-protected)." /></div>
-                <div style={{ fontSize: 12, color: '#64748b' }}>
-                  Never fall back to RPC buys if Jito bundle does not fully confirm
-                </div>
-                </div>
-              </div>
-            )}
-
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', marginTop: 16 }}
-              onClick={() => updateForm({ autoSellAfterLaunch: !form.autoSellAfterLaunch })}>
-              <div className={`toggle-track${form.autoSellAfterLaunch ? ' on' : ''}`} style={form.autoSellAfterLaunch ? { background: '#ef4444' } : undefined}>
-                <div className="toggle-knob" />
-              </div>
-              <div>
-                <div style={{ fontSize: 14, fontWeight: 500, color: form.autoSellAfterLaunch ? '#ef4444' : '#fff', display: 'flex', alignItems: 'center' }}>
-                  Sell All at Launch
-                  <Tip text="Instantly sells 100% of tokens from ALL wallets (Dev + Bundle) the moment the launch is confirmed on-chain. Happens server-side — zero delay, no button press needed. The sell fires within milliseconds of confirmation." />
-                </div>
-                <div style={{ fontSize: 12, color: '#64748b' }}>
-                  SELL ALL — dump Dev + Bundle tokens instantly after launch confirms
-                </div>
-              </div>
-            </div>
+          <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <h3 className="section-title" style={{ margin: 0 }}>Options</h3>
+            {toggle(form.useJito, () => set({ useJito: !form.useJito }), <>Jito bundle<Tip text="Create + dev buy + bundle buys as one atomic bundle (POST /api/sol/bundle): all land in the same block or not at all. Off: the create and the buys are sent one by one." /></>, `Tip ${plan ? plan.tipSol : '…'} SOL, set in Settings`)}
+            {form.useJito && toggle(form.strictBundle, () => set({ strictBundle: !form.strictBundle }), <>Strict bundle<Tip text="On: three bundle attempts, then fail. Off: if the bundle does not land, the create and buys go out one by one." /></>, 'Never fall back to plain sends')}
+            {toggle(form.autoSellAfterLaunch, () => set({ autoSellAfterLaunch: !form.autoSellAfterLaunch }), <span style={{ color: form.autoSellAfterLaunch ? '#fb7185' : undefined }}>Sell all at launch</span>, 'Dev + bundle wallets sell 100 % the moment the coin is on chain', '#ef4444')}
           </div>
 
-          {/* Launch Button */}
-          <button className="btn-primary" style={{
-              width: '100%', padding: '14px 0', fontSize: 15,
-              ...(insufficientFunds ? { background: '#991b1b', borderColor: '#dc2626' } : {}),
-            }}
-            disabled={launching || !form.tokenName || !form.tokenSymbol || insufficientFunds}
-            onClick={handleLaunch}>
-            {launching ? 'Launching...'
-              : insufficientFunds ? `Insufficient Funds (need ${totalSol.toFixed(3)} SOL, have ${fundingBalance?.toFixed(3)})`
-              : `Launch Token (${totalSol.toFixed(3)} SOL)`}
-          </button>
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button className="btn-secondary" style={{ flex: 1, padding: '13px 0', fontSize: 14 }} disabled={simulating || launching || !funding?.configured} onClick={simulate}>
+              <Busy busy={simulating} busyLabel="Simulating…">Simulate</Busy>
+            </button>
+            <button className="btn-primary" style={{ flex: 2, padding: '13px 0', fontSize: 15, ...(insufficient ? { background: '#991b1b' } : {}) }} disabled={launching || !ready || !funding?.configured || insufficient} onClick={launch}>
+              {launching ? <Busy busy>Launching…</Busy>
+                : !funding?.configured ? 'Create a funding wallet first (Wallets)'
+                : !ready ? 'Name, symbol and an image are needed'
+                : insufficient ? `Not enough SOL (need ${plan?.total.toFixed(3)}, have ${funding.balance?.toFixed(3)})`
+                : `Launch (${plan ? plan.total.toFixed(3) : '…'} SOL)`}
+            </button>
+          </div>
+          {error && <div style={{ fontSize: 12, color: '#fb7185' }}>{error}</div>}
         </div>
 
-        {/* ── Right column: Summary / Preview / Progress ── */}
+        {/* ── right: cost + simulation ── */}
         <div className="space-y">
-          {/* Summary */}
           <div className="card">
-            <h3 className="section-title">Summary</h3>
-            <div>
-              <div className="summary-row">
-                <span className="label-side">Dev Buy</span>
-                <span className="value-side accent">{form.devBuyAmount} SOL</span>
-              </div>
-              {form.bundleSwapAmounts.map((amt, i) => (
-                <div key={i} className="summary-row">
-                  <span className="label-side">Bundle {i + 1}</span>
-                  <span className="value-side">{amt} SOL</span>
-                </div>
-              ))}
-              {form.holderSwapAmounts.map((amt, i) => (
-                <div key={i} className="summary-row">
-                  <span className="label-side">Holder {i + 1}</span>
-                  <span className="value-side">{amt} SOL</span>
-                </div>
-              ))}
-              {form.useJito && (
-                <div className="summary-row">
-                  <span className="label-side">Jito Tip</span>
-                  <span className="value-side">~{tipSol.toFixed(3)} SOL</span>
-                </div>
-              )}
-              <div className="summary-row">
-                <span className="label-side" style={{ display: 'flex', alignItems: 'center' }}>Fees<Tip text="On-chain transaction fees and account rent costs. These are small and non-recoverable." width={180} /></span>
-                <span className="value-side" style={{ fontSize: 11 }}>~{((1 + form.bundleWalletCount + form.holderWalletCount) * 0.003).toFixed(4)} SOL</span>
-              </div>
-              <div className="summary-row">
-                <span className="label-side" style={{ display: 'flex', alignItems: 'center' }}>Buffer<Tip text="Extra SOL for gas and trading overhead per wallet. Most of it is returned when collecting SOL back to funding." width={200} /></span>
-                <span className="value-side" style={{ fontSize: 11 }}>~{(0.1 + form.bundleWalletCount * 0.02 + form.holderWalletCount * 0.01 - (1 + form.bundleWalletCount + form.holderWalletCount) * 0.003).toFixed(3)} SOL</span>
-              </div>
-              <div style={{ fontSize: 9, color: '#475569', marginTop: -2, marginBottom: 4, paddingLeft: 2, lineHeight: 1.35 }}>
-                <span style={{ fontStyle: 'italic' }}>Extra SOL for gas &amp; trading overhead per wallet. Most is returned when collecting SOL back.</span>
-              </div>
-              <div className="summary-row total">
-                <span className="label-side">Total</span>
-                <span className="value-side" style={insufficientFunds ? { color: '#ef4444' } : undefined}>{totalSol.toFixed(3)} SOL</span>
-              </div>
-            </div>
-
-            <details style={{ marginTop: 14, borderTop: '1px solid rgba(37,51,70,0.5)', paddingTop: 12 }}>
-              <summary style={{ fontSize: 11, fontWeight: 600, color: '#94a3b8', cursor: 'pointer', userSelect: 'none' }}>
-                Where does the SOL go?
-              </summary>
-              <div style={{ fontSize: 10, color: '#64748b', lineHeight: 1.6, marginTop: 8 }}>
-                <p style={{ marginBottom: 6 }}>
-                  <strong style={{ color: '#cbd5e1' }}>Funding wallet</strong> sends everything below. Total leaves your wallet once; the rest is where it ends up.
-                </p>
-                <ul style={{ margin: 0, paddingLeft: 14 }}>
-                  <li><strong>Dev Buy + Bundle + Holder amounts</strong> → Used to <strong>buy tokens</strong>. That SOL goes to the bonding curve; you get tokens in each wallet.</li>
-                  <li><strong>Jito Tip</strong> → Paid to Jito for the bundle. <strong>Gone.</strong></li>
-                  <li><strong>Fees</strong> → Tiny on-chain cost (account rent, tx fees). <strong>Gone.</strong></li>
-                  <li><strong>Buffer</strong> → Extra SOL sent so each wallet can pay for its own ATA + gas. It sits in those wallets after the buy. <strong>Recoverable</strong> when you “Collect SOL back” on the Trading page.</li>
-                </ul>
-                <p style={{ marginTop: 8, marginBottom: 0 }}>
-                  So most of the “expensive” number is either <strong>tokens you get</strong> or <strong>buffer you get back</strong>. Only the tip + fees are actually spent.
-                </p>
-              </div>
-            </details>
+            <h3 className="section-title">Cost</h3>
+            {plan ? (<>
+              <div className="summary-row"><span className="label-side">Dev wallet (buy {form.devBuyAmount} SOL + fees{plan.useLut ? ' + table rent' : ''})</span><span className="value-side accent">{plan.dev.toFixed(3)}</span></div>
+              {plan.bundle.map((b, i) => <div key={i} className="summary-row"><span className="label-side">Bundle {i + 1} (buy {form.bundleSwapAmounts[i]} SOL)</span><span className="value-side">{b.toFixed(3)}</span></div>)}
+              {plan.holder.map((h, i) => <div key={i} className="summary-row"><span className="label-side">Holder {i + 1} (buy {form.holderSwapAmounts[i]} SOL)</span><span className="value-side">{h.toFixed(3)}</span></div>)}
+              {form.useJito && <div className="summary-row"><span className="label-side">Jito tip (inside the dev amount)</span><span className="value-side">{plan.tipSol.toFixed(3)}</span></div>}
+              <div className="summary-row total"><span className="label-side">Leaves the funding wallet</span><span className="value-side" style={insufficient ? { color: '#ef4444' } : undefined}>{plan.total.toFixed(3)} SOL</span></div>
+              <p style={{ fontSize: 10, color: '#64748b', marginTop: 8, lineHeight: 1.5 }}>
+                The buys become tokens; the API fee is 0.5 % of each buy; the rest is a buffer each wallet keeps for fees and rent and comes back with Gather on the Wallets page. Funding wallet: {funding?.balance == null ? '…' : `${funding.balance.toFixed(4)} SOL`}.
+              </p>
+            </>) : <span style={{ fontSize: 12, color: '#64748b' }}>…</span>}
           </div>
 
-          {/* Token Preview */}
-          {form.tokenName && (
-            <div className="card">
-              <h3 className="section-title">Preview</h3>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                {(imagePreview || form.imageUrl) ? (
-                  <img src={imagePreview || form.imageUrl} alt="Token"
-                    style={{ width: 48, height: 48, borderRadius: 12, objectFit: 'cover', border: '1px solid #253346' }} />
-                ) : (
-                  <div style={{
-                    width: 48, height: 48, borderRadius: 12,
-                    background: 'linear-gradient(135deg, #14b8a6, #0d9488)',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    fontSize: 18, fontWeight: 700, color: '#fff',
-                  }}>
-                    {form.tokenSymbol?.[0] || '?'}
-                  </div>
-                )}
-                <div>
-                  <div style={{ fontWeight: 600, color: '#fff' }}>{form.tokenName}</div>
-                  <div className="font-mono" style={{ fontSize: 12, color: '#64748b' }}>
-                    ${form.tokenSymbol || '---'}
-                  </div>
+          {sim && (
+            <div className="card" style={{ borderColor: sim.ok ? 'rgba(52,211,153,0.3)' : 'rgba(251,191,36,0.3)' }}>
+              <h3 className="section-title" style={{ color: sim.ok ? '#34d399' : '#fbbf24' }}>{sim.ok ? 'Dry run passed' : 'Dry run: fix these first'}</h3>
+              {sim.checks.map((c, i) => (
+                <div key={i} style={{ display: 'flex', gap: 8, fontSize: 11, padding: '3px 0', color: c.ok ? '#94a3b8' : '#fbbf24' }}>
+                  <span style={{ color: c.ok ? '#34d399' : '#fb7185', width: 12 }}>{c.ok ? '✓' : '✗'}</span>
+                  <span style={{ width: 70, color: '#64748b' }}>{c.name}</span>
+                  <span style={{ flex: 1 }}>{c.detail}</span>
                 </div>
-              </div>
-              {(form.description || addTrenchyTagline) && (
-                <p style={{ fontSize: 12, color: '#94a3b8', marginTop: 12, lineHeight: 1.5, whiteSpace: 'pre-line' }}>
-                  {addTrenchyTagline && form.description
-                    ? `${form.description.trim()}\n\n\nLaunched with https://trenchytools.lol/`
-                    : form.description}
-                </p>
+              ))}
+              {sim.simulation && !sim.simulation.ok && sim.simulation.logs.length > 0 && (
+                <pre style={{ fontSize: 9, color: '#64748b', marginTop: 8, whiteSpace: 'pre-wrap', maxHeight: 120, overflow: 'auto' }}>{sim.simulation.logs.join('\n')}</pre>
               )}
             </div>
           )}
 
-          {/* Error shown inline if launch POST fails before redirect */}
-          {error && (
-            <div className="card" style={{ borderColor: 'rgba(244,63,94,0.2)' }}>
-              <div style={{ color: '#fb7185', fontSize: 12 }}>{error}</div>
+          {(stages.length > 0 || result || failed) && (
+            <div className="card" style={{ borderColor: failed ? 'rgba(251,113,133,0.3)' : result ? 'rgba(52,211,153,0.3)' : 'rgba(129,140,248,0.3)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                <h3 className="section-title" style={{ margin: 0, color: failed ? '#fb7185' : result ? '#34d399' : '#818cf8' }}>{failed ? 'Launch failed' : result ? 'Launched' : 'Launching…'}</h3>
+                {launching && <Busy busy><span /></Busy>}
+                {result && <div style={{ flex: 1 }} />}
+                {result && (<>
+                  <Link to={`/trading?mint=${result.mint}`} className="btn-primary" style={{ padding: '5px 10px', fontSize: 11 }}>Open in Trading</Link>
+                  <a className="btn-secondary" style={{ padding: '5px 10px', fontSize: 11 }} href={links(result.mint).pumpfun} target="_blank" rel="noreferrer">pump.fun</a>
+                  <a className="btn-secondary" style={{ padding: '5px 10px', fontSize: 11 }} href={links(result.mint).dexscreener} target="_blank" rel="noreferrer">dexscreener</a>
+                </>)}
+              </div>
+              {result && <div className="font-mono" style={{ fontSize: 11, color: '#e2e8f0', marginBottom: 8, wordBreak: 'break-all' }}>{result.mint}</div>}
+              <div style={{ maxHeight: 320, overflowY: 'auto', fontSize: 11, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                {stages.map((s, i) => (
+                  <div key={i} style={{ display: 'flex', gap: 8, color: stageColor(s.stage) }}>
+                    <span className="font-mono" style={{ color: '#475569', width: 90, flexShrink: 0 }}>{s.stage}</span>
+                    <span style={{ wordBreak: 'break-word' }}>{s.message}</span>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </div>

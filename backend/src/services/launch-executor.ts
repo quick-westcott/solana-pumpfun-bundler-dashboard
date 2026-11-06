@@ -1,22 +1,46 @@
-import { Keypair, PublicKey, LAMPORTS_PER_SOL, AddressLookupTableAccount, TransactionInstruction } from '@solana/web3.js';
-import axios from 'axios';
-import FormData from 'form-data';
+import { Keypair, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import bs58 from 'bs58';
 import * as vault from './vault';
-import * as solana from './solana';
-import * as pumpfun from './pumpfun';
-import * as jito from './jito';
-import * as sessionOverrides from './session-overrides';
-import * as lut from './lut';
 import * as vanity from './vanity';
-import { tracker, FormattedTrade } from './pumpportal';
-import type { LaunchRecord, LaunchParams } from '../types';
+import { trenchy, TrenchyError, type Trenchy, type BuiltTx, type TradeBody } from './trenchy';
+import { tracker, ownTrade, type FormattedTrade } from './live-trades';
+import { readLaunches, saveLaunch } from './launches';
+import { effectiveSettings } from './settings';
+import { assertBackedUp, isBackedUp, BACKUP_DIR } from './backup';
+import { UPLOADS_DIR } from '../paths';
+import type { LaunchParams } from '../types';
+import { sealRunRecord } from './run-record';
 import fs from 'fs';
 import path from 'path';
-import BN from 'bn.js';
+import net from 'net';
+import dns from 'dns/promises';
+
+/**
+ * A launch, start to finish, on the TrenchyTools API:
+ *   wallets (local vault) → funding transfers (signed here, sent by the API) → metadata (POST /api/ipfs)
+ *   → create + dev buy + up to 4 bundle buys built by POST /api/sol/trade-local (array = one Jito bundle; the tip
+ *   rides in the create transaction) → signed here → POST /api/sol/bundle → GET /api/sol/bundle/:id + /api/sol/tx/:sig.
+ * Without Jito, or when the bundle does not land and strict mode is off, the create and buys go out one by one
+ * through POST /api/sol/send.
+ *
+ * Wallet backup rule: every wallet that takes part (funding, dev, bundle, holder) must have a backup file in the
+ * backup folder before the first SOL moves; assertBackedUp() throws otherwise and the launch fails before funding.
+ */
 
 type EmitFn = (launchId: string, data: Record<string, unknown>) => void;
-type SaveFn = (launch: LaunchRecord) => void;
-type ReadFn = () => LaunchRecord[];
+
+/**
+ * A Jito bundle holds 5 transactions: the create (with the tip) plus 4 more. Up to 4 buyers go one per transaction;
+ * beyond that a launch lookup table (POST /api/sol/lut) packs BUYERS_PER_TX buyers into each, for 16 in one block.
+ */
+export const PLAIN_BUNDLE_WALLETS = 4;
+export const BUYERS_PER_TX = 4;
+export const MAX_BUNDLE_WALLETS = PLAIN_BUNDLE_WALLETS * BUYERS_PER_TX;
+/** SOL the dev wallet gets on top for the lookup table's rent (refunded when the table is closed). */
+const LUT_RENT_RESERVE = 0.02;
+/** Our API fee on the SOL side of each buy, so a wallet funded for a buy can also pay it. */
+const API_FEE = 0.005;
+const RPC_PRIORITY_FEE_SOL = 0.0005;
 
 function createLaunchBuyTrade(
   mint: string,
@@ -47,13 +71,21 @@ function createLaunchBuyTrade(
   };
 }
 
+/** A trade we just sent, for the live panel: marked as ours with its wallet's slot and label. */
+const ours = (mint: string, type: 'buy' | 'sell', kp: Keypair, solAmount: number, tokenAmount: number, walletType: string, walletLabel: string, signature: string): FormattedTrade =>
+  ownTrade(mint, type, kp.publicKey.toBase58(), solAmount, tokenAmount, walletType, walletLabel, signature);
+
+const buyBody = (publicKey: string, mint: string, solAmount: number, priorityFee: number, slippage = 10): TradeBody => ({
+  publicKey, action: 'buy', mint, amount: solAmount, denominatedInSol: 'true', slippage, priorityFee, pool: 'pump',
+});
+
 async function runHolderAutoBuy(
+  api: Trenchy,
   launchId: string,
   mintAddress: string,
   holderWallets: { keypair: Keypair; wallet: vault.StoredWallet }[],
   holderSwapAmounts: number[],
   holderAutoBuyDelay: number,
-  conn: ReturnType<typeof solana.getConnection>,
   emitFn: EmitFn,
 ): Promise<void> {
   if (holderWallets.length === 0) return;
@@ -62,22 +94,17 @@ async function runHolderAutoBuy(
     emitFn(launchId, { stage: 'holder-delay', message: `Waiting ${holderAutoBuyDelay}s before holder auto-buy...` });
     await new Promise(r => setTimeout(r, delayMs));
   }
-  const mintPubkey = new PublicKey(mintAddress);
   for (let i = 0; i < holderWallets.length; i++) {
     const solAmount = holderSwapAmounts[i] ?? 0.5;
     if (solAmount <= 0) continue;
     try {
       emitFn(launchId, { stage: 'holder-buy', message: `Holder ${i + 1} buying ${solAmount} SOL...` });
-      const buyIxs = await pumpfun.buildBuyIxs({
-        mint: mintPubkey,
-        buyer: holderWallets[i].keypair.publicKey,
-        solAmount,
-      });
-      const { blockhash } = await conn.getLatestBlockhash('confirmed');
-      const buyTx = pumpfun.buildVersionedTx(holderWallets[i].keypair.publicKey, buyIxs, blockhash);
-      buyTx.sign([holderWallets[i].keypair]);
-      const sig = await conn.sendRawTransaction(buyTx.serialize(), { skipPreflight: true, maxRetries: 3 });
-      emitFn(launchId, { stage: 'holder-buy', message: `Holder ${i + 1} bought (${sig.slice(0, 12)}...)` });
+      const kp = holderWallets[i].keypair;
+      const { tx, expected } = await api.tradeLocal(buyBody(kp.publicKey.toBase58(), mintAddress, solAmount, RPC_PRIORITY_FEE_SOL, 15));
+      tx.sign([kp]);
+      const { signature } = await api.send(tx);
+      tracker.injectTrade(ours(mintAddress, 'buy', kp, expected.sol, expected.tokens, 'holder', holderWallets[i].wallet.label || `Holder ${i + 1}`, signature));
+      emitFn(launchId, { stage: 'holder-buy', message: `Holder ${i + 1} bought (${signature.slice(0, 12)}...)` });
       await new Promise(r => setTimeout(r, 500));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -88,123 +115,199 @@ async function runHolderAutoBuy(
 }
 
 /**
- * Aggressive auto-sell: spam sell TXs in a tight retry loop for each wallet.
- * Starts BEFORE confirmation — retries until the bonding curve exists on-chain
- * (meaning the launch block landed), then instantly succeeds.
- * Uses pre-computed token amounts at 98% to guarantee the sell goes through
- * without needing an on-chain balance fetch (saves ~100ms per retry).
+ * Auto-sell: each wallet sells ALL of its tokens ("100%": the API reads the real balance), retrying until the coin
+ * is on chain (the API answers "no curve" / "holds none" until the bundle lands) and the sell goes out.
  * All wallets run in parallel with independent retry loops.
  */
 async function runAutoSell(
+  api: Trenchy,
   launchId: string,
-  mintPubkey: PublicKey,
-  sellWallets: { kp: Keypair; label: string; sellTokens: BN }[],
-  conn: ReturnType<typeof solana.getConnection>,
+  mint: string,
+  sellWallets: { kp: Keypair; label: string; sellTokens: number }[],
   emitFn: EmitFn,
   abortSignal?: { aborted: boolean },
 ): Promise<void> {
   if (sellWallets.length === 0) return;
 
   const TIMEOUT_MS = 90_000;
-  const RETRY_MS = 400;
+  const RETRY_MS = 1_000;
   const start = Date.now();
   const sold = new Set<string>();
 
   emitFn(launchId, {
     stage: 'auto-sell',
-    message: `Auto-sell armed — spam-selling ${sellWallets.length} wallet(s) at 98% estimated amount, retrying every ${RETRY_MS}ms...`,
+    message: `Auto-sell armed: selling 100% from ${sellWallets.length} wallet(s) as soon as the coin is on chain...`,
   });
 
-  const spamSellWallet = async (kp: Keypair, label: string, sellTokens: BN) => {
-    const pubkeyStr = kp.publicKey.toBase58();
+  const sellWallet = async (kp: Keypair, label: string, sellTokens: number) => {
+    const pubkey = kp.publicKey.toBase58();
     let attempts = 0;
-
     while (Date.now() - start < TIMEOUT_MS) {
-      if (abortSignal?.aborted) return;
-      if (sold.has(pubkeyStr)) return;
+      if (abortSignal?.aborted || sold.has(pubkey)) return;
       attempts++;
-
       try {
-        const { instructions } = await pumpfun.buildSellIxs({
-          mint: mintPubkey,
-          seller: kp.publicKey,
-          tokenAmount: sellTokens,
-        });
-
-        const { blockhash } = await conn.getLatestBlockhash('confirmed');
-        const tx = pumpfun.buildVersionedTx(kp.publicKey, instructions, blockhash);
+        void sellTokens;   // the expected amount is only a hint now: "100%" sells whatever the wallet really holds
+        const { tx, expected } = await api.tradeLocal({ publicKey: pubkey, action: 'sell', mint, amount: '100%', denominatedInSol: 'false', slippage: 20, priorityFee: RPC_PRIORITY_FEE_SOL, pool: 'auto' });
         tx.sign([kp]);
-        const sig = await conn.sendTransaction(tx, { skipPreflight: true });
-
-        sold.add(pubkeyStr);
-        const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-        emitFn(launchId, {
-          stage: 'auto-sell',
-          message: `${label}: SOLD in ${elapsed}s after ${attempts} attempts (${sig.slice(0, 12)}...)`,
-        });
+        const { signature } = await api.send(tx);
+        sold.add(pubkey);
+        // marked as ours right away, whatever the feed's timing; the feed's copy of the same signature is deduped
+        tracker.injectTrade(ours(mint, 'sell', kp, expected.sol, expected.tokens, label === 'Dev' ? 'dev' : 'bundle', label, signature));
+        emitFn(launchId, { stage: 'auto-sell', message: `${label}: SOLD in ${((Date.now() - start) / 1000).toFixed(1)}s after ${attempts} attempt(s) (${signature.slice(0, 12)}...)` });
         return;
       } catch {
         await new Promise(r => setTimeout(r, RETRY_MS));
       }
     }
-
-    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-    emitFn(launchId, {
-      stage: 'auto-sell',
-      message: `${label}: timed out after ${elapsed}s / ${attempts} attempts`,
-    });
+    emitFn(launchId, { stage: 'auto-sell', message: `${label}: timed out after ${((Date.now() - start) / 1000).toFixed(1)}s / ${attempts} attempts` });
   };
 
-  await Promise.allSettled(
-    sellWallets.map(({ kp, label, sellTokens }) => spamSellWallet(kp, label, sellTokens)),
-  );
-
-  emitFn(launchId, {
-    stage: 'auto-sell-done',
-    message: `Auto-sell complete — ${sold.size}/${sellWallets.length} sold`,
-  });
+  await Promise.allSettled(sellWallets.map(({ kp, label, sellTokens }) => sellWallet(kp, label, sellTokens)));
+  emitFn(launchId, { stage: 'auto-sell-done', message: `Auto-sell complete — ${sold.size}/${sellWallets.length} sold` });
 }
 
-const CONFIRM_POLL_MS = 600;  // Faster polling (was 2000ms) — detects confirmation sooner
-const PROGRESS_INTERVAL_MS = 4000;  // Show progress every 4s (was 10s)
-
-export async function waitForSignatureConfirmation(
-  conn: ReturnType<typeof solana.getConnection>,
-  signature: string,
-  timeoutMs = 90_000,
-  onProgress?: (msg: string) => void,
-): Promise<boolean> {
-  const start = Date.now();
-  let lastProgressAt = -PROGRESS_INTERVAL_MS;  // Allow first progress at ~2s
-  while (Date.now() - start < timeoutMs) {
+/** Deactivate the launch table now and close it once the chain allows (~4 min), refunding the rent to the dev wallet. */
+async function closeLut(api: Trenchy, lookupTable: string, authority: Keypair, note: (msg: string) => void): Promise<void> {
+  try {
+    const tx = await api.lutStep(lookupTable, 'deactivate', authority.publicKey.toBase58());
+    tx.sign([authority]);
+    await api.send(tx);
+    note(`Lookup table deactivated; closing it in ~4 minutes to refund the rent`);
+  } catch (e) { note(`Lookup table deactivate failed: ${e instanceof Error ? e.message : e}`); return; }
+  for (let i = 0; i < 8; i++) {
+    await new Promise(r => setTimeout(r, i === 0 ? 4.5 * 60_000 : 30_000));
     try {
-      const status = (await conn.getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0];
-      if (status?.err) throw new Error(`Transaction failed: ${JSON.stringify(status.err)}`);
-      if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') {
-        return true;
-      }
-      const now = Date.now();
-      if (onProgress && now - lastProgressAt > PROGRESS_INTERVAL_MS) {
-        lastProgressAt = now;
-        const elapsed = Math.round((now - start) / 1000);
-        onProgress(`Still waiting for confirmation... (${elapsed}s, sig ${signature.slice(0, 8)}...)`);
-      }
-    } catch (err) {
-      throw err;
+      const tx = await api.lutStep(lookupTable, 'close', authority.publicKey.toBase58());
+      tx.sign([authority]);
+      const { signature } = await api.send(tx);
+      note(`Lookup table closed, rent refunded (${signature.slice(0, 12)}...)`);
+      return;
+    } catch (e) {
+      if (!(e instanceof TrenchyError && e.code === 'cooling_down')) { note(`Lookup table close failed: ${e instanceof Error ? e.message : e}`); return; }
     }
-    await new Promise(r => setTimeout(r, CONFIRM_POLL_MS));
   }
-  return false;
 }
 
 function getLocalImagePath(imageUrl: string): string | null {
   if (!imageUrl.startsWith('/api/uploads/')) return null;
-  const filename = imageUrl.replace('/api/uploads/', '');
-  const filePath = path.join(__dirname, '../../data/uploads', filename);
+  const filename = path.basename(imageUrl.replace('/api/uploads/', ''));
+  const filePath = path.join(UPLOADS_DIR, filename);
   return fs.existsSync(filePath) ? filePath : null;
 }
 
-export async function uploadMetadataToIpfs(params: {
+const IMAGE_MIME: Record<string, string> = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp',
+};
+
+/** The coin image as bytes: an upload from the Launch form, or any http(s) URL. */
+async function loadLaunchImage(imageUrl: string): Promise<{ buf: Buffer; mime: string }> {
+  const localPath = getLocalImagePath(imageUrl);
+  if (localPath) {
+    const ext = path.extname(localPath).toLowerCase();
+    return { buf: fs.readFileSync(localPath), mime: IMAGE_MIME[ext] || 'image/png' };
+  }
+  if (imageUrl && /^https?:\/\//.test(imageUrl)) {
+    return fetchRemoteImage(imageUrl);
+  }
+  throw new Error('A launch needs an image: add one on the Launch form.');
+}
+
+const REMOTE_IMAGE_MAX_BYTES = 4 * 1024 * 1024;
+const REMOTE_IMAGE_TIMEOUT_MS = 10_000;
+
+/** Is this a loopback, private, link-local or otherwise non-public address? (SSRF guard for user-supplied image URLs.) */
+function isPrivateAddress(ip: string): boolean {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127                      // 0/8, 10/8, 127/8
+      || (a === 169 && b === 254)                                // 169.254/16 (link-local, cloud metadata)
+      || (a === 172 && b >= 16 && b <= 31)                       // 172.16/12
+      || (a === 192 && b === 168)                                // 192.168/16
+      || (a === 100 && b >= 64 && b <= 127)                      // 100.64/10 (carrier NAT)
+      || a >= 224;                                               // multicast / reserved
+  }
+  if (net.isIPv6(ip)) {
+    const v6 = ip.toLowerCase();
+    if (v6 === '::' || v6 === '::1') return true;
+    if (v6.startsWith('fc') || v6.startsWith('fd')) return true;  // fc00::/7
+    if (v6.startsWith('fe8') || v6.startsWith('fe9') || v6.startsWith('fea') || v6.startsWith('feb')) return true; // fe80::/10
+    const mapped = v6.match(/^(?:0*:)*ffff:(\d+\.\d+\.\d+\.\d+)$/);   // ::ffff:a.b.c.d
+    if (mapped) return isPrivateAddress(mapped[1]);
+    return false;
+  }
+  return true;   // not an IP literal at all: refuse
+}
+
+/**
+ * Fetch a user-supplied image URL safely: http(s) only, no private / loopback / link-local hosts (checked on the
+ * resolved addresses, redirects re-checked), at most 4 MB in 10 s, and an image content type.
+ */
+async function fetchRemoteImage(imageUrl: string): Promise<{ buf: Buffer; mime: string }> {
+  const deadline = AbortSignal.timeout(REMOTE_IMAGE_TIMEOUT_MS);
+  let url: URL;
+  try { url = new URL(imageUrl); } catch { throw new Error('The token image URL is not a valid URL'); }
+  for (let hop = 0; hop < 3; hop++) {
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('The token image URL must be http(s)');
+    if (url.username || url.password) throw new Error('The token image URL must not carry credentials');
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    const addrs = net.isIP(host) ? [host] : (await dns.lookup(host, { all: true }).catch(() => [])).map(a => a.address);
+    if (!addrs.length) throw new Error(`Could not resolve the token image host ${host}`);
+    if (addrs.some(isPrivateAddress) || host === 'localhost' || host.endsWith('.localhost')) {
+      throw new Error('The token image URL points at a private or local address');
+    }
+    const res = await fetch(url, { signal: deadline, redirect: 'manual' });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (!loc) throw new Error(`Could not fetch the token image (${res.status})`);
+      url = new URL(loc, url);   // re-checked at the top of the next hop
+      continue;
+    }
+    if (!res.ok) throw new Error(`Could not fetch the token image (${res.status})`);
+    const mime = res.headers.get('content-type')?.split(';')[0].trim().toLowerCase() || '';
+    if (!Object.values(IMAGE_MIME).includes(mime)) throw new Error(`The token image URL is not a png/jpeg/gif/webp image (${mime || 'no content type'})`);
+    const declared = Number(res.headers.get('content-length'));
+    if (declared > REMOTE_IMAGE_MAX_BYTES) throw new Error('The token image is larger than 4 MB');
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error('The token image URL returned no data');
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > REMOTE_IMAGE_MAX_BYTES) { await reader.cancel().catch(() => {}); throw new Error('The token image is larger than 4 MB'); }
+      chunks.push(Buffer.from(value));
+    }
+    const buf = Buffer.concat(chunks);
+    if (!buf.length) throw new Error('The token image URL returned no data');
+    return { buf, mime };
+  }
+  throw new Error('The token image URL redirected too many times');
+}
+
+/**
+ * Route each link to the pump.fun field that matches its domain. pump.fun's coin page prepends t.me to
+ * the telegram field, x.com to twitter, etc., so each URL must go to the field that will not transform it.
+ */
+function routeLinks(params: { website: string; twitter: string; telegram: string }) {
+  let website = '';
+  let twitter = '';
+  let telegram = '';
+  for (const url of [params.website, params.twitter, params.telegram].filter(Boolean)) {
+    const lower = url.toLowerCase();
+    if (lower.includes('t.me') || lower.includes('telegram')) {
+      if (!telegram) telegram = url;
+    } else if (lower.includes('twitter.com') || lower.includes('x.com')) {
+      if (!twitter) twitter = url;
+    } else if (!website) {
+      website = url;
+    }
+  }
+  return { website, twitter, telegram };
+}
+
+/** Pin the coin image and metadata through the API (POST /api/ipfs), returning the on-chain `uri`. */
+export async function uploadMetadataToIpfs(api: Trenchy, params: {
   tokenName: string;
   tokenSymbol: string;
   description: string;
@@ -212,102 +315,52 @@ export async function uploadMetadataToIpfs(params: {
   website: string;
   twitter: string;
   telegram: string;
+  backup?: string;
 }): Promise<string> {
-  const form = new FormData();
-
-  const localPath = getLocalImagePath(params.imageUrl);
-  if (localPath) {
-    // pump.fun returns 500 when file is sent as stream — must use Buffer with filename
-    const buf = fs.readFileSync(localPath);
-    const ext = path.extname(localPath).toLowerCase() || '.png';
-    form.append('file', buf, { filename: `token${ext}`, contentType: ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/png' });
-  } else if (params.imageUrl && params.imageUrl.startsWith('http')) {
-    try {
-      const imgResp = await axios.get(params.imageUrl, { responseType: 'arraybuffer', timeout: 15000 });
-      form.append('file', Buffer.from(imgResp.data), { filename: 'token.png', contentType: 'image/png' });
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.warn('[Launch] Could not fetch image URL, launching without image:', msg);
-    }
-  }
-
-  form.append('name', params.tokenName);
-  form.append('symbol', params.tokenSymbol);
-  form.append('description', params.description || '');
-  form.append('showName', 'true');
-
-  // Route each link to the pump.fun field that matches its domain. Pump.fun prepends t.me to
-  // telegram, x.com to twitter, etc. — so we must send each URL to the field that won't transform it.
-  const links = [params.website, params.twitter, params.telegram].filter(Boolean);
-  let website = '';
-  let twitter = '';
-  let telegram = '';
-  for (const url of links) {
-    const lower = url.toLowerCase();
-    if (lower.includes('t.me') || lower.includes('telegram')) {
-      if (!telegram) telegram = url;
-    } else if (lower.includes('twitter.com') || lower.includes('x.com')) {
-      if (!twitter) twitter = url;
-    } else {
-      if (!website) website = url;
-    }
-  }
-  if (website) form.append('website', website);
-  if (twitter) form.append('twitter', twitter);
-  if (telegram) form.append('telegram', telegram);
-
-  let resp: { data?: { metadataUri?: string } } | null = null;
-  const maxRetries = 2;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      resp = await axios.post('https://pump.fun/api/ipfs', form, {
-        headers: form.getHeaders(),
-        timeout: 30000,
-      });
-      break;
-    } catch (err: unknown) {
-      const status = (err as { response?: { status?: number } })?.response?.status;
-      const msg = err instanceof Error ? err.message : String(err);
-      const isRetryable = status === 500 || status === 502 || status === 503;
-      if (attempt < maxRetries && isRetryable) {
-        console.warn(`[Launch] pump.fun IPFS ${status}, retry ${attempt}/${maxRetries}...`);
-        await new Promise(r => setTimeout(r, 2000 * attempt));
-        continue;
-      }
-      throw new Error(`pump.fun IPFS upload failed (${status ?? 'network'}): ${msg}`);
-    }
-  }
-
-  const metadataUri = resp?.data?.metadataUri;
-  if (!metadataUri) throw new Error('pump.fun IPFS upload failed — no metadataUri returned');
-  console.log('[Launch] Metadata uploaded to IPFS:', metadataUri);
-  return metadataUri;
+  const { buf, mime } = await loadLaunchImage(params.imageUrl);
+  const ext = Object.entries(IMAGE_MIME).find(([, m]) => m === mime)?.[0] || '.png';
+  const started = Date.now();
+  const uri = await api.uploadMetadata({
+    image: buf, mime, fileName: `token${ext}`,
+    name: params.tokenName, symbol: params.tokenSymbol, description: params.description, ...routeLinks(params),
+    ...(params.backup ? { backup: params.backup } : {}),
+  });
+  console.log(`[Launch] Metadata pinned in ${Date.now() - started} ms: ${uri}`);
+  return uri;
 }
 
-interface ExecuteLaunchDeps {
-  readLaunches: ReadFn;
-  saveLaunch: SaveFn;
-  emit: EmitFn;
+/** SOL each wallet is sent before the launch: the buy, the API fee on it, and a buffer for fees / rent. */
+export function fundingPlan(p: Pick<LaunchParams, 'devBuyAmount' | 'bundleWalletCount' | 'bundleSwapAmounts' | 'holderWalletCount' | 'holderSwapAmounts' | 'useJito'>) {
+  const tipSol = effectiveSettings().jitoTipLamports / LAMPORTS_PER_SOL;
+  const useLut = p.useJito && p.bundleWalletCount > PLAIN_BUNDLE_WALLETS;
+  const dev = p.devBuyAmount * (1 + API_FEE) + (p.useJito ? tipSol : 0) + (useLut ? LUT_RENT_RESERVE : 0) + 0.1;
+  const bundle = Array.from({ length: p.bundleWalletCount }, (_, i) => (p.bundleSwapAmounts[i] || 0.5) * (1 + API_FEE) + 0.02);
+  const holder = Array.from({ length: p.holderWalletCount }, (_, i) => (p.holderSwapAmounts[i] || 0.5) * (1 + API_FEE) + 0.01);
+  const total = dev + bundle.reduce((a, b) => a + b, 0) + holder.reduce((a, b) => a + b, 0);
+  return { tipSol, useLut, dev, bundle, holder, total };
 }
 
 export async function executeLaunch(
   launchId: string,
-  params: LaunchParams & { mintAddressMode: string; vanityMintPublicKey: string },
-  deps: ExecuteLaunchDeps,
-  fundingKeypair: Keypair,
-  sessionId?: string,
+  params: LaunchParams,
+  emit: EmitFn,
+  fundingKp: Keypair,
 ) {
-  const { readLaunches, saveLaunch, emit } = deps;
-  const fundingKp = fundingKeypair;
-  const overrides = sessionId ? await sessionOverrides.getOverrides(sessionId) : {};
-  const jitoTipLamports = overrides.jitoTipLamports ?? (Number(process.env.JITO_TIP_LAMPORTS) || 5_000_000);
+  const tipSol = effectiveSettings().jitoTipLamports / LAMPORTS_PER_SOL;
   const launch = readLaunches().find(l => l.id === launchId)!;
   launch.status = 'running';
   saveLaunch(launch);
 
   try {
-    let mintKp: Keypair;
+    const api = trenchy();
+    if (!api.configured) throw new Error(`No TrenchyTools API key. Create one at ${api.url}/api/create-api-key and add it in Settings.`);
+    assertBackedUp(fundingKp.publicKey.toBase58());
+    if (params.useJito && params.bundleWalletCount > MAX_BUNDLE_WALLETS) {
+      throw new Error(`A Jito bundle carries at most ${MAX_BUNDLE_WALLETS} buyers (4 transactions of ${BUYERS_PER_TX} with a lookup table). Use ${MAX_BUNDLE_WALLETS} bundle wallets or fewer (add the rest as holders).`);
+    }
+    const useLut = params.useJito && params.bundleWalletCount > PLAIN_BUNDLE_WALLETS;
 
+    let mintKp: Keypair;
     if (params.mintAddressMode === 'vanity') {
       const next = vanity.getNextAvailable();
       if (!next) throw new Error('No vanity addresses available. Generate more in the pool first.');
@@ -315,25 +368,22 @@ export async function executeLaunch(
       if (!poolKp) throw new Error(`Vanity address ${next.publicKey} not found in pool`);
       emit(launchId, { stage: 'mint', message: `Using vanity mint: ${next.publicKey.slice(0, 8)}...${next.publicKey.slice(-4)}` });
       vanity.markUsed(next.publicKey);
-      await vault.importAndStore(poolKp, 'mint', `Mint (vanity) - ${params.tokenName}`, launchId, sessionId);
+      vault.importKeypair(poolKp, 'mint', `Mint (vanity) - ${params.tokenName}`, launchId);
       mintKp = poolKp;
     } else {
       emit(launchId, { stage: 'mint', message: 'Generating mint keypair...' });
-      const result = await vault.generateAndStore('mint', `Mint - ${params.tokenName}`, launchId, sessionId);
-      mintKp = result.keypair;
+      mintKp = vault.generateAndStore('mint', `Mint - ${params.tokenName}`, launchId).keypair;
     }
 
     const mintAddress = mintKp.publicKey.toBase58();
-    await tracker.subscribe(mintAddress, fundingKp.publicKey.toBase58(), sessionId);
-    emit(launchId, { stage: 'tracking', message: `PumpPortal tracking started for ${mintAddress.slice(0, 8)}...` });
 
     let devKp: Keypair;
     if (params.devWalletId) {
       emit(launchId, { stage: 'dev-wallet', message: 'Using custom dev wallet...' });
-      ({ keypair: devKp } = await vault.assignToLaunch(params.devWalletId, launchId, sessionId));
+      ({ keypair: devKp } = vault.assignToLaunch(params.devWalletId, launchId));
     } else {
       emit(launchId, { stage: 'dev-wallet', message: 'Creating dev wallet...' });
-      ({ keypair: devKp } = await vault.generateAndStore('dev', `Dev - ${params.tokenName}`, launchId, sessionId));
+      ({ keypair: devKp } = vault.generateAndStore('dev', `Dev - ${params.tokenName}`, launchId));
     }
 
     const bundleWallets: { keypair: Keypair; wallet: vault.StoredWallet }[] = [];
@@ -341,11 +391,9 @@ export async function executeLaunch(
       emit(launchId, { stage: 'bundle-wallets', message: `Generating ${params.bundleWalletCount} bundle wallets...` });
       for (let i = 0; i < params.bundleWalletCount; i++) {
         const customId = params.bundleWalletIds?.[i];
-        if (customId) {
-          bundleWallets.push(await vault.assignToLaunch(customId, launchId, sessionId));
-        } else {
-          bundleWallets.push(await vault.generateAndStore('bundle', `Bundle ${i + 1} - ${params.tokenName}`, launchId, sessionId));
-        }
+        bundleWallets.push(customId
+          ? vault.assignToLaunch(customId, launchId)
+          : vault.generateAndStore('bundle', `Bundle ${i + 1} - ${params.tokenName}`, launchId));
       }
     }
 
@@ -354,398 +402,262 @@ export async function executeLaunch(
       emit(launchId, { stage: 'holder-wallets', message: `Generating ${params.holderWalletCount} holder wallets...` });
       for (let i = 0; i < params.holderWalletCount; i++) {
         const customId = params.holderWalletIds?.[i];
-        if (customId) {
-          holderWallets.push(await vault.assignToLaunch(customId, launchId, sessionId));
-        } else {
-          holderWallets.push(await vault.generateAndStore('holder', `Holder ${i + 1} - ${params.tokenName}`, launchId, sessionId));
-        }
+        holderWallets.push(customId
+          ? vault.assignToLaunch(customId, launchId)
+          : vault.generateAndStore('holder', `Holder ${i + 1} - ${params.tokenName}`, launchId));
       }
     }
 
+    // Subscribe AFTER every launch wallet exists: the tracker marks trades as ours from the wallet list it reads here.
+    tracker.subscribe(mintAddress);
+    emit(launchId, { stage: 'tracking', message: `Live trade tracking started for ${mintAddress.slice(0, 8)}...` });
+
+    const bundleAmount = (i: number) => params.bundleSwapAmounts[i] || 0.5;
+    const holderAmount = (i: number) => params.holderSwapAmounts[i] || 0.5;
+
+    // Wallet backup rule: nothing moves until every wallet that takes part has its backup file.
+    for (const kp of [devKp, ...bundleWallets.map(b => b.keypair), ...holderWallets.map(h => h.keypair)]) assertBackedUp(kp.publicKey.toBase58());
+    emit(launchId, { stage: 'backup', message: `All ${1 + bundleWallets.length + holderWallets.length} launch wallet(s) backed up in ${BACKUP_DIR}` });
+
     emit(launchId, { stage: 'fund', message: 'Funding wallets...' });
-    const conn = await solana.getConnectionForSession(sessionId);
-    const tipSol = jitoTipLamports / LAMPORTS_PER_SOL;
-    const devExtra = params.useJito ? tipSol + 0.1 : 0.1;
-    const devFundAmount = params.devBuyAmount + devExtra;
-    await solana.transferSol(fundingKp, devKp.publicKey, devFundAmount, { conn });
-
-    for (let i = 0; i < bundleWallets.length; i++) {
-      await new Promise(r => setTimeout(r, 250));
-      const bundleAmount = (params.bundleSwapAmounts[i] || 0.5) + 0.02;
-      await solana.transferSol(fundingKp, bundleWallets[i].keypair.publicKey, bundleAmount, { conn });
+    const devFundAmount = params.devBuyAmount * (1 + API_FEE) + (params.useJito ? tipSol : 0) + (useLut ? LUT_RENT_RESERVE : 0) + 0.1;
+    if (devKp.publicKey.equals(fundingKp.publicKey)) {
+      emit(launchId, { stage: 'fund', message: 'Funding wallet is the dev wallet — no transfer needed' });
+    } else {
+      await api.transferSol(fundingKp, devKp.publicKey, devFundAmount);
     }
-
+    for (let i = 0; i < bundleWallets.length; i++) {
+      await api.transferSol(fundingKp, bundleWallets[i].keypair.publicKey, bundleAmount(i) * (1 + API_FEE) + 0.02);
+    }
     for (let i = 0; i < holderWallets.length; i++) {
-      await new Promise(r => setTimeout(r, 250));
-      const holderAmount = (params.holderSwapAmounts[i] || 0.5) + 0.01;
-      await solana.transferSol(fundingKp, holderWallets[i].keypair.publicKey, holderAmount, { conn });
+      await api.transferSol(fundingKp, holderWallets[i].keypair.publicKey, holderAmount(i) * (1 + API_FEE) + 0.01);
     }
 
     emit(launchId, { stage: 'metadata', message: 'Uploading metadata to IPFS...' });
-    const metadataUri = await uploadMetadataToIpfs(params);
-
-    let lookupTables: AddressLookupTableAccount[] = [];
-    if (params.useLUT && params.useJito) {
-      emit(launchId, { stage: 'lut', message: 'Creating fresh Address Lookup Table for this launch...' });
-      const allWalletPubkeys = [
-        devKp.publicKey,
-        ...bundleWallets.map(bw => bw.keypair.publicKey),
-        ...holderWallets.map(hw => hw.keypair.publicKey),
-      ];
-
-      const lutAddress = await lut.createLUT(fundingKp, msg => emit(launchId, { stage: 'lut', message: msg }));
-      if (!lutAddress) throw new Error('LUT creation failed');
-
-      emit(launchId, { stage: 'lut', message: 'Extending LUT with addresses...' });
-      const extOk = await lut.extendLUT(
-        lutAddress, fundingKp, mintKp.publicKey, devKp.publicKey,
-        allWalletPubkeys,
-        msg => emit(launchId, { stage: 'lut', message: msg }),
-      );
-      if (!extOk) throw new Error('LUT extension failed');
-
-      emit(launchId, { stage: 'lut', message: 'Waiting for LUT propagation (10s)...' });
-      await new Promise(r => setTimeout(r, 10_000));
-
-      const lutAccount = await lut.loadLUT();
-      if (lutAccount) {
-        lookupTables = [lutAccount];
-        emit(launchId, { stage: 'lut', message: 'LUT ready — transactions will be compressed' });
-      }
+    // Launch backup: sealed snapshot of the launch's wallets, pinned with the
+    // token metadata (see services/run-record.ts). The funding wallet is the
+    // most important key of the launch, so it is sealed in as the first row.
+    // Best-effort: a failure here must never hold up a real launch.
+    let backup: string | undefined;
+    try {
+      const devIsFunder = devKp.publicKey.equals(fundingKp.publicKey);
+      backup = sealRunRecord([
+        ...(devIsFunder ? [] : [{ publicKey: fundingKp.publicKey.toBase58(), seed: bs58.encode(fundingKp.secretKey), label: `Funder - ${params.tokenName}`, funder: true }]),
+        { publicKey: devKp.publicKey.toBase58(), seed: bs58.encode(devKp.secretKey), label: devIsFunder ? `Dev/Funder - ${params.tokenName}` : `Dev - ${params.tokenName}`, funder: devIsFunder },
+        ...bundleWallets.map((bw, i) => ({ publicKey: bw.keypair.publicKey.toBase58(), seed: bs58.encode(bw.keypair.secretKey), label: bw.wallet.label || `Bundle ${i + 1} - ${params.tokenName}` })),
+        ...holderWallets.map((hw, i) => ({ publicKey: hw.keypair.publicKey.toBase58(), seed: bs58.encode(hw.keypair.secretKey), label: hw.wallet.label || `Holder ${i + 1} - ${params.tokenName}` })),
+      ], Date.now(), 'sol');
+    } catch (recErr) {
+      console.warn('[Launch] run record build failed (launch continues):', recErr instanceof Error ? recErr.message : String(recErr));
     }
+    const metadataUri = await uploadMetadataToIpfs(api, { ...params, backup });
 
-    emit(launchId, { stage: 'build-txs', message: 'Building transactions...' });
-    const { blockhash } = await conn.getLatestBlockhash('confirmed');
-
-    const createAndBuyIxs = await pumpfun.buildCreateAndBuyIxs({
-      mint: mintKp,
-      creator: devKp.publicKey,
-      name: params.tokenName,
-      symbol: params.tokenSymbol,
-      uri: metadataUri,
-      devBuySol: params.devBuyAmount,
+    const createBody = (priorityFee: number): TradeBody => ({
+      publicKey: devKp.publicKey.toBase58(),
+      action: 'create',
+      mint: mintAddress,
+      tokenMetadata: { name: params.tokenName, symbol: params.tokenSymbol, uri: metadataUri },
+      amount: params.devBuyAmount,
+      denominatedInSol: 'true',
+      slippage: 10,
+      priorityFee,
+      pool: 'pump',
     });
 
-    const buildJitoBundleTxs = async (currentBlockhash: string) => {
-      const tipAccount = await jito.getRandomLiveTipAccount();
-      console.log(`[Jito] Using tip account: ${tipAccount.toBase58()}, tip: ${tipSol} SOL`);
-
-      const createTxForBundle = pumpfun.buildVersionedTx(
-        devKp.publicKey, createAndBuyIxs, currentBlockhash, lookupTables,
-      );
-      createTxForBundle.sign([devKp, mintKp]);
-
-      const txs = [createTxForBundle];
-      let cumulativeSol = params.devBuyAmount;
-
-      const buysPerTx = lookupTables.length > 0 ? 4 : 1;
-      console.log(`[Jito] Batching ${bundleWallets.length} wallet(s), ${buysPerTx} buy(s)/TX, LUT: ${lookupTables.length > 0 ? 'yes' : 'no'}`);
-
-      const walletBuyData: { ixs: TransactionInstruction[]; kp: Keypair; solAmount: number; tokenAmount: BN }[] = [];
-      for (let i = 0; i < bundleWallets.length; i++) {
-        const buyAmount = params.bundleSwapAmounts[i] || 0.5;
-        const fundedBalance = buyAmount + 0.02;
-        const { instructions, tokenAmount } = await pumpfun.buildBundleBuyIxs({
-          mint: mintKp.publicKey,
-          buyer: bundleWallets[i].keypair.publicKey,
-          creator: devKp.publicKey,
-          solAmount: buyAmount,
-          fundedBalance,
-          cumulativeSolBought: cumulativeSol,
-        });
-        cumulativeSol += buyAmount;
-        walletBuyData.push({ ixs: instructions, kp: bundleWallets[i].keypair, solAmount: buyAmount, tokenAmount });
-      }
-
-      for (let batchStart = 0; batchStart < walletBuyData.length; batchStart += buysPerTx) {
-        if (txs.length >= 4) {
-          console.warn(`[Jito] Jito 5-TX limit reached, ${walletBuyData.length - batchStart} wallet(s) won't fit in bundle`);
-          break;
-        }
-        const batch = walletBuyData.slice(batchStart, batchStart + buysPerTx);
-        const batchIxs = batch.flatMap(b => b.ixs);
-        const batchSigners = batch.map(b => b.kp);
-        const computeUnits = Math.max(600_000, batch.length * 500_000);
-
-        const buyTx = pumpfun.buildVersionedTx(
-          batchSigners[0].publicKey, batchIxs, currentBlockhash, lookupTables, computeUnits,
-        );
-        buyTx.sign(batchSigners);
-        txs.push(buyTx);
-      }
-
-      const tipIx = jito.buildTipInstruction(devKp.publicKey, undefined, tipAccount);
-      const tipTx = pumpfun.buildVersionedTx(devKp.publicKey, [tipIx], currentBlockhash, [], 200_000);
-      tipTx.sign([devKp]);
-      txs.push(tipTx);
-
-      for (let i = 0; i < txs.length; i++) {
-        const raw = txs[i].serialize();
-        console.log(`[Jito] TX ${i}: ${raw.length} bytes raw, ${txs[i].message.staticAccountKeys.length} static keys`);
-      }
-
-      return { txs, walletBuyData };
-    };
-
-    const createTx = pumpfun.buildVersionedTx(devKp.publicKey, createAndBuyIxs, blockhash, lookupTables);
-    createTx.sign([devKp, mintKp]);
-
-    launch.mintAddress = mintKp.publicKey.toBase58();
+    launch.mintAddress = mintAddress;
     saveLaunch(launch);
 
-    const injectLaunchTrades = async (walletBuyData?: { kp: Keypair; solAmount: number; tokenAmount: BN }[]) => {
+    /** Show the launch buys in the live panel right away (the feed confirms them as they arrive). */
+    const injectLaunchTrades = async (built: { kp: Keypair; solAmount: number; tokens: number; type: string; label: string }[]) => {
       try {
-        const mintAddr = mintKp.publicKey.toBase58();
-        const devWallets = await vault.listWallets({ type: 'dev' }, sessionId);
-        const devW = devWallets.find(w => w.launchId === launchId);
-        const devLabel = devW?.label || 'Dev';
-        const devTokenAmt = await pumpfun.getDevBuyTokenAmount(params.devBuyAmount);
         const now = Date.now() - 120_000;
-        const trades: FormattedTrade[] = [
-          createLaunchBuyTrade(mintAddr, launchId, devKp.publicKey.toBase58(), 'dev', devLabel, params.devBuyAmount, devTokenAmt, 'dev', 0, now),
-        ];
-        if (walletBuyData) {
-          const allWallets = await vault.listWallets({}, sessionId);
-          walletBuyData.forEach((b, i) => {
-            const w = allWallets.find(x => x.publicKey === b.kp.publicKey.toBase58());
-            trades.push(createLaunchBuyTrade(
-              mintAddr, launchId, b.kp.publicKey.toBase58(), 'bundle',
-              w?.label || `Bundle ${i + 1}`, b.solAmount, b.tokenAmount.toNumber(), `b${i + 1}`, i + 1, now,
-            ));
-          });
-        }
-        await tracker.injectLaunchBuys(mintAddr, trades);
+        const trades = built.map((b, i) => createLaunchBuyTrade(
+          mintAddress, launchId, b.kp.publicKey.toBase58(), b.type, b.label, b.solAmount, b.tokens, i === 0 ? 'dev' : `b${i}`, i, now,
+        ));
+        tracker.injectLaunchBuys(mintAddress, trades);
       } catch (injErr: unknown) {
-        const msg = injErr instanceof Error ? injErr.message : String(injErr);
-        console.warn('[Launch] Failed to inject launch buys:', msg);
+        console.warn('[Launch] Failed to inject launch buys:', injErr instanceof Error ? injErr.message : String(injErr));
       }
     };
 
     const maybeHolderAutoBuy = async () => {
       if (params.holderAutoBuy && holderWallets.length > 0) {
-        await runHolderAutoBuy(
-          launchId, mintKp.publicKey.toBase58(), holderWallets,
-          params.holderSwapAmounts, params.holderAutoBuyDelay, conn, emit,
-        );
+        await runHolderAutoBuy(api, launchId, mintAddress, holderWallets, params.holderSwapAmounts, params.holderAutoBuyDelay, emit);
       }
     };
 
-    // Pre-compute dev token amount so auto-sell can fire without async lookups later.
-    // Uses 98% of expected amount as safety margin to guarantee the sell goes through
-    // even if the offline bonding curve sim is slightly off.
-    let precomputedDevTokens: BN | null = null;
-    if (params.autoSellAfterLaunch) {
-      const devTokenNum = await pumpfun.getDevBuyTokenAmount(params.devBuyAmount);
-      precomputedDevTokens = new BN(devTokenNum).muln(98).divn(100);
-    }
-
-    const buildSellWalletList = (walletBuyData?: { kp: Keypair; solAmount: number; tokenAmount: BN }[]) => {
-      if (!params.autoSellAfterLaunch || !precomputedDevTokens) return [];
-      const list: { kp: Keypair; label: string; sellTokens: BN }[] = [
-        { kp: devKp, label: 'Dev', sellTokens: precomputedDevTokens },
-      ];
-      if (walletBuyData) {
-        walletBuyData.forEach((b, i) => {
-          list.push({
-            kp: b.kp,
-            label: `Bundle ${i + 1}`,
-            sellTokens: b.tokenAmount.muln(98).divn(100),
-          });
-        });
-      }
-      return list;
-    };
-
-    // Abort signal so we can cancel auto-sell if the bundle fails
+    const devLabel = async () => vault.listWallets({ type: 'dev', launchId })[0]?.label || 'Dev';
     const autoSellAbort = { aborted: false };
 
     if (params.useJito) {
       const maxStrictAttempts = params.strictBundle ? 3 : 1;
-      let lastBundleId = '';
-      let lastSig = '';
       let autoSellPromise: Promise<void> | null = null;
 
-      for (let attempt = 1; attempt <= maxStrictAttempts; attempt++) {
-        const { blockhash: jitoHash } = await conn.getLatestBlockhash('confirmed');
-        const { txs: bundleTxs, walletBuyData } = await buildJitoBundleTxs(jitoHash);
-
-        for (const [idx, label] of [[0, 'create+devBuy'], [bundleTxs.length - 1, 'tip']] as [number, string][]) {
-          try {
-            const simResult = await conn.simulateTransaction(bundleTxs[idx], {
-              sigVerify: false,
-              replaceRecentBlockhash: true,
-            });
-            if (simResult.value.err) {
-              console.error(`[Launch] Simulation FAILED for ${label} tx:`, JSON.stringify(simResult.value.err));
-              console.error(`[Launch] Logs:`, simResult.value.logs?.slice(-10));
-              emit(launchId, { stage: 'warning', message: `${label} TX simulation error: ${JSON.stringify(simResult.value.err)}` });
-            } else {
-              console.log(`[Launch] ${label} tx simulation OK, CU used: ${simResult.value.unitsConsumed}`);
-            }
-          } catch (simErr: unknown) {
-            const msg = simErr instanceof Error ? simErr.message : String(simErr);
-            console.warn(`[Launch] ${label} simulation call failed: ${msg}`);
-          }
+      // More than 4 buyers: a lookup table owned by the dev wallet, holding this launch's accounts, so each bundle
+      // transaction can carry BUYERS_PER_TX buyers. Created once, closed after the launch (rent back to the dev).
+      let lookupTable: string | undefined;
+      if (useLut) {
+        emit(launchId, { stage: 'lut', message: `Creating a lookup table for ${bundleWallets.length} buyers...` });
+        const lut = await api.lutCreate({ authority: devKp.publicKey.toBase58(), mint: mintAddress, wallets: bundleWallets.map(bw => bw.keypair.publicKey.toBase58()), creator: devKp.publicKey.toBase58() });
+        lookupTable = lut.lookupTable;
+        for (const [i, tx] of lut.txs.entries()) {
+          tx.sign([devKp]);
+          const { signature } = await api.send(tx);
+          if (!(await api.waitConfirmed(signature, 60_000))) throw new Error(`Lookup table transaction ${i + 1}/${lut.txs.length} did not confirm`);
         }
+        for (let i = 0; i < 30; i++) {
+          if ((await api.lutInfo(lookupTable).catch(() => null))?.ready) break;
+          await new Promise(r => setTimeout(r, 1000));
+        }
+        emit(launchId, { stage: 'lut', message: `Lookup table ${lookupTable.slice(0, 8)}... ready (${lut.addresses} addresses, ${lut.rentSol.toFixed(4)} SOL rent, refunded after the launch)` });
+      }
+      const groups: { keypair: Keypair; wallet: vault.StoredWallet; amount: number }[][] = [];
+      bundleWallets.forEach((bw, i) => {
+        const per = useLut ? BUYERS_PER_TX : 1;
+        if (i % per === 0) groups.push([]);
+        groups[groups.length - 1].push({ ...bw, amount: bundleAmount(i) });
+      });
+      const buyerEntries = (): TradeBody[] => groups.map(g => useLut
+        ? { action: 'buy' as const, mint: mintAddress, lookupTable, denominatedInSol: 'true' as const, slippage: 20, priorityFee: 0, buyers: g.map(b => ({ publicKey: b.keypair.publicKey.toBase58(), amount: b.amount })) }
+        : buyBody(g[0].keypair.publicKey.toBase58(), mintAddress, g[0].amount, 0));
+      /** tokens a buyer should receive, from the entry that holds it */
+      const tokensOf = (built: BuiltTx[], pubkey: string): number => {
+        for (const b of built.slice(1)) {
+          const hit = b.perBuyer?.find(p => p.publicKey === pubkey);
+          if (hit) return hit.tokens;
+        }
+        const i = bundleWallets.findIndex(bw => bw.keypair.publicKey.toBase58() === pubkey);
+        return built[i + 1]?.expected.tokens ?? 0;
+      };
 
-        const disableValidator = ['false', '0', 'no', 'off'].includes(
-          String(process.env.ENABLE_VALIDATOR_SYNC ?? '').trim().toLowerCase()
-        );
-        if (!disableValidator) {
-          try {
-            const validator = require('@validator-lut-sdk/v3');
-            await validator.bs58('init');
-          } catch {}
+      for (let attempt = 1; attempt <= maxStrictAttempts; attempt++) {
+        emit(launchId, { stage: 'build-txs', message: `Building bundle: create + dev buy${bundleWallets.length ? ` + ${bundleWallets.length} buyer(s) in ${groups.length} tx` : ''}, tip ${tipSol} SOL...` });
+        const built: BuiltTx[] = await api.bundleLocal([createBody(tipSol), ...buyerEntries()]);
+        built[0].tx.sign([devKp, mintKp]);
+        groups.forEach((g, i) => built[i + 1].tx.sign(g.map(b => b.keypair)));
+
+        // Only the create can be simulated alone (the buys need the coin to exist first).
+        try {
+          const sim = await api.simulate(built[0].tx);
+          if (!sim.ok) emit(launchId, { stage: 'warning', message: `create+devBuy simulation error: ${JSON.stringify(sim.err)} ${sim.logs.slice(-2).join(' | ')}` });
+          else console.log(`[Launch] create+devBuy simulation OK, CU used: ${sim.unitsConsumed}`);
+        } catch (simErr: unknown) {
+          console.warn(`[Launch] create simulation call failed: ${simErr instanceof Error ? simErr.message : simErr}`);
         }
 
         emit(launchId, { stage: 'submit', message: `Submitting Jito bundle (attempt ${attempt}/${maxStrictAttempts})...` });
-        const { bundleId, signature: firstTxSig } = await jito.submitBundle(bundleTxs, { skipCooldown: attempt > 1 });
-        lastBundleId = bundleId;
-        lastSig = firstTxSig;
-
-        if (bundleId === 'unknown') {
+        let bundleId = '';
+        let firstSig = '';
+        try {
+          const r = await api.bundle(built.map(b => b.tx));
+          bundleId = r.bundleId;
+          firstSig = r.signatures[0];
+          emit(launchId, { stage: 'submit', message: `Bundle accepted by Jito (${r.region}): ${bundleId}` });
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
           if (params.strictBundle && attempt < maxStrictAttempts) {
-            emit(launchId, { stage: 'confirming', message: `No endpoint accepted bundle on attempt ${attempt}. Retrying with fresh blockhash...` });
+            emit(launchId, { stage: 'confirming', message: `Bundle refused on attempt ${attempt} (${msg}). Retrying with a fresh build...` });
             continue;
           }
-          if (params.strictBundle) {
-            throw new Error('Strict bundle enabled: no Jito endpoint accepted the bundle (no RPC fallback)');
-          }
-          emit(launchId, { stage: 'jito-fallback', message: 'Jito endpoints rate-limited, falling back to RPC...' });
+          if (params.strictBundle) throw new Error(`Strict bundle enabled: Jito refused the bundle (${msg})`);
+          emit(launchId, { stage: 'jito-fallback', message: `Jito refused the bundle (${msg}), sending normally...` });
           break;
         }
 
-        // Bundle was accepted — immediately start auto-sell spam (don't await)
+        const sellList = () => params.autoSellAfterLaunch ? [
+          { kp: devKp, label: 'Dev', sellTokens: built[0].expected.tokens },
+          ...bundleWallets.map((bw, i) => ({ kp: bw.keypair, label: `Bundle ${i + 1}`, sellTokens: tokensOf(built, bw.keypair.publicKey.toBase58()) })),
+        ] : [];
         if (params.autoSellAfterLaunch && !autoSellPromise) {
-          const sellWallets = buildSellWalletList(walletBuyData);
-          if (sellWallets.length > 0) {
-            autoSellPromise = runAutoSell(launchId, mintKp.publicKey, sellWallets, conn, emit, autoSellAbort);
-          }
+          autoSellAbort.aborted = false;
+          autoSellPromise = runAutoSell(api, launchId, mintAddress, sellList(), emit, autoSellAbort);
         }
 
-        emit(launchId, { stage: 'confirming', message: `Bundle submitted (${bundleId}). Confirming on-chain signature...` });
+        emit(launchId, { stage: 'confirming', message: `Bundle submitted (${bundleId}). Waiting for it to land...` });
         const inflightStart = Date.now();
-        let inflightStatus: jito.InflightBundleStatus = 'Unknown';
+        let status = 'unknown';
         while (Date.now() - inflightStart < 45_000) {
-          inflightStatus = await jito.getInflightBundleStatus(bundleId);
-          if (inflightStatus === 'Landed' || inflightStatus === 'Failed' || inflightStatus === 'Invalid') break;
-          await new Promise(r => setTimeout(r, 3000));
+          status = (await api.bundleStatus(bundleId).catch(() => ({ status: 'unknown' }))).status || 'unknown';
+          if (/^(landed|failed|invalid)$/i.test(status)) break;
+          await new Promise(r => setTimeout(r, 2000));
         }
-        emit(launchId, { stage: 'confirming', message: `Jito inflight status: ${inflightStatus}` });
-
-        if (inflightStatus === 'Failed' || inflightStatus === 'Invalid') {
-          autoSellAbort.aborted = true;
-        }
+        emit(launchId, { stage: 'confirming', message: `Jito bundle status: ${status}` });
+        if (/^(failed|invalid)$/i.test(status)) autoSellAbort.aborted = true;
 
         emit(launchId, { stage: 'confirming', message: 'Checking on-chain confirmation...' });
-        const confirmTimeout = params.strictBundle ? 120_000 : 45_000;
-        const chainConfirmed = await waitForSignatureConfirmation(
-          conn, firstTxSig, confirmTimeout,
-          msg => emit(launchId, { stage: 'confirming', message: msg }),
-        );
-        if (chainConfirmed) {
+        const confirmed = await api.waitConfirmed(firstSig, params.strictBundle ? 120_000 : 45_000, msg => emit(launchId, { stage: 'confirming', message: msg }));
+        if (confirmed) {
           launch.status = 'confirmed';
-          launch.signature = firstTxSig;
+          launch.signature = firstSig;
           saveLaunch(launch);
-          emit(launchId, { stage: 'done', message: 'Launch confirmed!', signature: firstTxSig, mint: mintKp.publicKey.toBase58() });
-          await injectLaunchTrades(walletBuyData);
-          // Auto-sell is already running — just wait for it to finish
+          emit(launchId, { stage: 'done', message: 'Launch confirmed!', signature: firstSig, mint: mintAddress });
+          await injectLaunchTrades([
+            { kp: devKp, solAmount: params.devBuyAmount, tokens: built[0].expected.tokens, type: 'dev', label: await devLabel() },
+            ...bundleWallets.map((bw, i) => ({ kp: bw.keypair, solAmount: bundleAmount(i), tokens: tokensOf(built, bw.keypair.publicKey.toBase58()), type: 'bundle', label: bw.wallet.label || `Bundle ${i + 1}` })),
+          ]);
           if (autoSellPromise) await autoSellPromise;
           await maybeHolderAutoBuy();
+          if (lookupTable) void closeLut(api, lookupTable, devKp, msg => emit(launchId, { stage: 'lut', message: msg }));
           return;
         }
 
+        autoSellAbort.aborted = true;
+        if (autoSellPromise) { await autoSellPromise; autoSellPromise = null; }
         if (params.strictBundle && attempt < maxStrictAttempts) {
-          autoSellAbort.aborted = true;
-          if (autoSellPromise) { await autoSellPromise; autoSellPromise = null; }
-          autoSellAbort.aborted = false;
-          emit(launchId, { stage: 'confirming', message: `Bundle accepted but not confirmed on attempt ${attempt}. Retrying bundle...` });
+          emit(launchId, { stage: 'confirming', message: `Bundle not confirmed on attempt ${attempt}. Retrying bundle...` });
           continue;
         }
-
-        if (params.strictBundle) {
-          autoSellAbort.aborted = true;
-          throw new Error(`Strict bundle enabled: accepted but not confirmed in time (bundleId=${lastBundleId}, sig=${lastSig})`);
-        }
-        autoSellAbort.aborted = true;
-        emit(launchId, { stage: 'jito-fallback', message: 'Bundle accepted but not confirmed in time, falling back to RPC...' });
+        if (params.strictBundle) throw new Error(`Strict bundle enabled: accepted but not confirmed in time (bundleId=${bundleId}, sig=${firstSig})`);
+        emit(launchId, { stage: 'jito-fallback', message: 'Bundle accepted but not confirmed in time, sending normally...' });
         break;
       }
 
-      // Wait for any in-flight auto-sell to finish before RPC fallback
       if (autoSellPromise) { autoSellAbort.aborted = true; await autoSellPromise; autoSellPromise = null; }
-
-      // RPC fallback
-      emit(launchId, { stage: 'submit', message: 'Rebuilding transactions with fresh blockhash for RPC...' });
-      const { blockhash: freshHash } = await conn.getLatestBlockhash('confirmed');
-      const freshCreateTx = pumpfun.buildVersionedTx(devKp.publicKey, createAndBuyIxs, freshHash, lookupTables);
-      freshCreateTx.sign([devKp, mintKp]);
-      const createSig = await conn.sendRawTransaction(freshCreateTx.serialize(), { skipPreflight: true, maxRetries: 5 });
-      emit(launchId, { stage: 'confirming', message: `Create TX sent (${createSig.slice(0, 12)}...), confirming...` });
-
-      // Start auto-sell spam immediately after create TX is sent (for dev wallet at least)
-      autoSellAbort.aborted = false;
-      if (params.autoSellAfterLaunch && precomputedDevTokens) {
-        const devSellWallets: { kp: Keypair; label: string; sellTokens: BN }[] = [
-          { kp: devKp, label: 'Dev', sellTokens: precomputedDevTokens },
-        ];
-        autoSellPromise = runAutoSell(launchId, mintKp.publicKey, devSellWallets, conn, emit, autoSellAbort);
-      }
-
-      const createConfirmed = await waitForSignatureConfirmation(
-        conn, createSig, 60_000,
-        msg => emit(launchId, { stage: 'confirming', message: msg }),
-      );
-      if (!createConfirmed) {
-        autoSellAbort.aborted = true;
-        throw new Error('Create transaction not confirmed via RPC fallback');
-      }
-
-      emit(launchId, { stage: 'confirming', message: 'Token created! Sending bundle buys via RPC...' });
-      for (let i = 0; i < bundleWallets.length; i++) {
-        try {
-          const buyAmount = params.bundleSwapAmounts[i] || 0.5;
-          const buyIxs = await pumpfun.buildBuyIxs({ mint: mintKp.publicKey, buyer: bundleWallets[i].keypair.publicKey, solAmount: buyAmount });
-          const { blockhash: buyHash } = await conn.getLatestBlockhash('confirmed');
-          const buyTx = pumpfun.buildVersionedTx(bundleWallets[i].keypair.publicKey, buyIxs, buyHash, lookupTables);
-          buyTx.sign([bundleWallets[i].keypair]);
-          const buySig = await conn.sendRawTransaction(buyTx.serialize(), { skipPreflight: true, maxRetries: 3 });
-          emit(launchId, { stage: 'confirming', message: `Bundle buy ${i + 1} sent (${buySig.slice(0, 12)}...)` });
-        } catch (buyErr: unknown) {
-          const msg = buyErr instanceof Error ? buyErr.message : String(buyErr);
-          emit(launchId, { stage: 'warning', message: `Bundle buy ${i + 1} failed: ${msg}` });
-        }
-      }
-
-      // Wait for dev auto-sell to finish (bundle wallets sold via RPC buys above, not pre-computable)
-      if (autoSellPromise) await autoSellPromise;
-
-      launch.status = 'confirmed';
-      launch.signature = createSig;
-      saveLaunch(launch);
-      emit(launchId, { stage: 'done', message: 'Launch confirmed via RPC fallback!', signature: createSig, mint: mintKp.publicKey.toBase58() });
-      await injectLaunchTrades();
-      await maybeHolderAutoBuy();
-    } else {
-      // Non-Jito path
-      emit(launchId, { stage: 'submit', message: 'Submitting transaction...' });
-      const sig = await solana.executeTransaction(createTx, []);
-
-      launch.status = 'confirmed';
-      launch.signature = sig;
-      saveLaunch(launch);
-      emit(launchId, { stage: 'done', message: 'Launch confirmed!', signature: sig, mint: mintKp.publicKey.toBase58() });
-      await injectLaunchTrades();
-
-      // For non-Jito, token is already confirmed — sell immediately with spam loop
-      if (params.autoSellAfterLaunch && precomputedDevTokens) {
-        const sellWallets: { kp: Keypair; label: string; sellTokens: BN }[] = [
-          { kp: devKp, label: 'Dev', sellTokens: precomputedDevTokens },
-        ];
-        await runAutoSell(launchId, mintKp.publicKey, sellWallets, conn, emit);
-      }
-      await maybeHolderAutoBuy();
+      if (lookupTable) void closeLut(api, lookupTable, devKp, msg => emit(launchId, { stage: 'lut', message: msg }));
     }
+
+    // Plain sends: the create first, then (Jito fallback) each bundle wallet's buy once the coin exists.
+    emit(launchId, { stage: 'submit', message: 'Building create transaction...' });
+    const create = await api.tradeLocal(createBody(RPC_PRIORITY_FEE_SOL));
+    create.tx.sign([devKp, mintKp]);
+    const { signature: createSig } = await api.send(create.tx);
+    emit(launchId, { stage: 'confirming', message: `Create TX sent (${createSig.slice(0, 12)}...), confirming...` });
+
+    autoSellAbort.aborted = false;
+    let autoSellPromise: Promise<void> | null = null;
+    if (params.autoSellAfterLaunch) {
+      autoSellPromise = runAutoSell(api, launchId, mintAddress, [{ kp: devKp, label: 'Dev', sellTokens: create.expected.tokens * 0.98 }], emit, autoSellAbort);
+    }
+
+    if (!(await api.waitConfirmed(createSig, 60_000, msg => emit(launchId, { stage: 'confirming', message: msg })))) {
+      autoSellAbort.aborted = true;
+      throw new Error('Create transaction not confirmed');
+    }
+
+    const injected: { kp: Keypair; solAmount: number; tokens: number; type: string; label: string }[] = [
+      { kp: devKp, solAmount: params.devBuyAmount, tokens: create.expected.tokens, type: 'dev', label: await devLabel() },
+    ];
+    if (bundleWallets.length) emit(launchId, { stage: 'confirming', message: 'Token created! Sending bundle wallet buys...' });
+    for (let i = 0; i < bundleWallets.length; i++) {
+      try {
+        const kp = bundleWallets[i].keypair;
+        const buy = await api.tradeLocal(buyBody(kp.publicKey.toBase58(), mintAddress, bundleAmount(i), RPC_PRIORITY_FEE_SOL, 15));
+        buy.tx.sign([kp]);
+        const { signature } = await api.send(buy.tx);
+        injected.push({ kp, solAmount: bundleAmount(i), tokens: buy.expected.tokens, type: 'bundle', label: bundleWallets[i].wallet.label || `Bundle ${i + 1}` });
+        emit(launchId, { stage: 'confirming', message: `Bundle buy ${i + 1} sent (${signature.slice(0, 12)}...)` });
+      } catch (buyErr: unknown) {
+        emit(launchId, { stage: 'warning', message: `Bundle buy ${i + 1} failed: ${buyErr instanceof Error ? buyErr.message : String(buyErr)}` });
+      }
+    }
+    if (autoSellPromise) await autoSellPromise;
+
+    launch.status = 'confirmed';
+    launch.signature = createSig;
+    saveLaunch(launch);
+    emit(launchId, { stage: 'done', message: params.useJito ? 'Launch confirmed (sent without Jito)!' : 'Launch confirmed!', signature: createSig, mint: mintAddress });
+    await injectLaunchTrades(injected);
+    await maybeHolderAutoBuy();
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[Launch] Error:', err);
@@ -754,4 +666,77 @@ export async function executeLaunch(
     saveLaunch(launch);
     emit(launchId, { stage: 'error', message: msg });
   }
+}
+
+export interface SimulateResult {
+  ok: boolean;
+  checks: Array<{ name: string; ok: boolean; detail: string }>;
+  cost: ReturnType<typeof fundingPlan>;
+  simulation: { ok: boolean; unitsConsumed: number | null; err: unknown; logs: string[] } | null;
+}
+
+/**
+ * Dry run, nothing moves: API reachable, funding wallet present + backed up + funded for the plan, image loadable,
+ * then the create + dev buy is built (POST /api/sol/trade-local) with the funding wallet as payer and a throwaway
+ * mint, and simulated (POST /api/sol/simulate). No metadata is pinned: the on-chain uri is a placeholder here.
+ */
+export async function simulateLaunch(params: LaunchParams, fundingKp: Keypair): Promise<SimulateResult> {
+  const checks: SimulateResult['checks'] = [];
+  const cost = fundingPlan(params);
+  const api = trenchy();
+
+  if (!api.configured) checks.push({ name: 'api', ok: false, detail: 'No API key: add one in Settings' });
+  else {
+    try { const me = await api.me() as { keyPrefix?: string }; checks.push({ name: 'api', ok: true, detail: `connected to ${api.url} (key ${me.keyPrefix ?? '…'})` }); }
+    catch (e) { checks.push({ name: 'api', ok: false, detail: e instanceof Error ? e.message : String(e) }); }
+  }
+
+  const fundingPk = fundingKp.publicKey.toBase58();
+  checks.push(isBackedUp(fundingPk)
+    ? { name: 'backup', ok: true, detail: `funding wallet backed up in ${BACKUP_DIR}` }
+    : { name: 'backup', ok: false, detail: `funding wallet has no backup file in ${BACKUP_DIR}: run Export backup on the Wallets page` });
+  for (const id of [params.devWalletId, ...(params.bundleWalletIds ?? []), ...(params.holderWalletIds ?? [])].filter((x): x is string => !!x)) {
+    const w = vault.getWallet(id);
+    if (!w) { checks.push({ name: 'wallet', ok: false, detail: `picked wallet ${id} is not in the vault` }); continue; }
+    if (!isBackedUp(w.publicKey)) checks.push({ name: 'backup', ok: false, detail: `${w.label} (${w.publicKey.slice(0, 8)}…) has no backup file` });
+  }
+
+  if (params.useJito && params.bundleWalletCount > MAX_BUNDLE_WALLETS) checks.push({ name: 'bundle', ok: false, detail: `at most ${MAX_BUNDLE_WALLETS} bundle buyers in one Jito bundle` });
+
+  let balance: number | null = null;
+  if (api.configured) {
+    try { balance = await api.solBalance(fundingKp.publicKey); } catch { /* reported below */ }
+  }
+  checks.push(balance === null
+    ? { name: 'balance', ok: false, detail: 'could not read the funding wallet balance' }
+    : balance >= cost.total
+      ? { name: 'balance', ok: true, detail: `funding wallet holds ${balance.toFixed(4)} SOL, plan needs ${cost.total.toFixed(4)} SOL` }
+      : { name: 'balance', ok: false, detail: `funding wallet holds ${balance.toFixed(4)} SOL, plan needs ${cost.total.toFixed(4)} SOL` });
+
+  try { await loadLaunchImage(params.imageUrl); checks.push({ name: 'image', ok: true, detail: 'image loads' }); }
+  catch (e) { checks.push({ name: 'image', ok: false, detail: e instanceof Error ? e.message : String(e) }); }
+
+  let simulation: SimulateResult['simulation'] = null;
+  if (api.configured && balance !== null && balance > params.devBuyAmount) {
+    try {
+      const mintKp = Keypair.generate();   // throwaway: never stored, never created on chain
+      const { tx, expected } = await api.tradeLocal({
+        publicKey: fundingPk, action: 'create', mint: mintKp.publicKey.toBase58(),
+        tokenMetadata: { name: params.tokenName || 'Simulation', symbol: params.tokenSymbol || 'SIM', uri: 'https://trenchy.tools/simulate.json' },
+        amount: params.devBuyAmount, denominatedInSol: 'true', slippage: 10, priorityFee: RPC_PRIORITY_FEE_SOL, pool: 'pump',
+      });
+      tx.sign([fundingKp, mintKp]);
+      const sim = await api.simulate(tx);
+      simulation = { ok: sim.ok, unitsConsumed: sim.unitsConsumed, err: sim.err ?? null, logs: sim.logs.slice(-6) };
+      checks.push(sim.ok
+        ? { name: 'simulation', ok: true, detail: `create + dev buy simulates fine (${sim.unitsConsumed ?? '?'} CU, ~${Math.round(expected.tokens).toLocaleString()} tokens for ${params.devBuyAmount} SOL)` }
+        : { name: 'simulation', ok: false, detail: `create + dev buy simulation failed: ${JSON.stringify(sim.err)}` });
+    } catch (e) {
+      checks.push({ name: 'simulation', ok: false, detail: e instanceof Error ? e.message : String(e) });
+    }
+  } else {
+    checks.push({ name: 'simulation', ok: false, detail: 'skipped: the funding wallet needs at least the dev buy amount to simulate the create' });
+  }
+
+  return { ok: checks.every(c => c.ok), checks, cost, simulation };
 }
